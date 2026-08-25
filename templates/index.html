@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <!-- Modern font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="navbar">
+            <div class="logo">
+                <h1>🍽️ {{ title }} Dashboard</h1>
+            </div>
+            <div class="nav-links">
+                <a href="#restaurants" class="nav-link active" data-target="restaurants-view">Restaurants & Menu</a>
+                <a href="#chat" class="nav-link" data-target="chat-view">AI Assistant</a>
+            </div>
+            <div class="status-indicator" id="health-status">
+                <span class="dot checking"></span> Checking...
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Restaurants View -->
+            <section id="restaurants-view" class="view active">
+                <div class="section-header">
+                    <h2>Top 10 Rated Restaurants</h2>
+                    <button class="btn-primary" id="refresh-restaurants">Refresh Data</button>
+                </div>
+                <div id="restaurants-grid" class="grid">
+                    <!-- Cards will be dynamically injected here -->
+                    <div class="loading-state">Loading restaurants...</div>
+                </div>
+            </section>
+
+            <!-- Chat View -->
+            <section id="chat-view" class="view" style="display: none;">
+                <div class="section-header">
+                    <h2>AI Assistant</h2>
+                </div>
+                <div class="chat-container">
+                    <div id="chat-messages" class="chat-messages full-chat">
+                        <div class="message bot">
+                            <p>Hi! What would you like help with?</p>
+                            <div class="starter-prompts" aria-label="Suggested questions">
+                                <button type="button" class="starter-prompt" data-prompt="How can I order a meal?">1. Order a meal</button>
+                                <button type="button" class="starter-prompt" data-prompt="I'm not sure what to eat. Help me decide based on our chat.">2. Help me choose what to eat</button>
+                                <button type="button" class="starter-prompt" data-prompt="Show me the top 5 cafes.">3. Show the top 5 cafés</button>
+                            </div>
+                        </div>
+                    </div>
+                    <form id="chat-form" class="chat-input-area">
+                        <input type="text" id="chat-input" placeholder="Type your message..." required autocomplete="off">
+                        <button type="submit" class="btn-send" aria-label="Send message">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                        </button>
+                    </form>
+                </div>
+            </section>
+        </main>
+
+    </div>
+
+    <!-- Custom JS -->
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

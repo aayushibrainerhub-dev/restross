@@ -1,0 +1,32 @@
+[project]
+name = "restros"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "aayushibrainerhub-dev", email = "aayushi.brainerhub@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "email-validator>=2.0.0",
+    "fastapi>=0.141.1",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.0.0",
+    "python-multipart>=0.0.32",
+    "psycopg[binary]>=3.2.0",
+    "sqlalchemy>=2.0.0",
+    "uvicorn>=0.52.4",
+    "jinja2>=3.1.2",
+    "alembic>=1.19.1",
+    "psycopg-binary>=3.3.4",
+    "psycopg2-binary>=2.9.12",
+    "httpx>=0.28.1",
+    "langchain-core>=1.6.0",
+]
+
+[project.scripts]
+restros = "restros:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
