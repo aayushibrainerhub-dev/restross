@@ -25,7 +25,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(30), default="staff")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class Restaurant(Base):
@@ -48,7 +48,7 @@ class Customer(Base):
     full_name: Mapped[str] = mapped_column(String(150))
     phone: Mapped[str | None] = mapped_column(String(40), unique=True)
     email: Mapped[str | None] = mapped_column(String(255), unique=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     orders: Mapped[list["Order"]] = relationship(back_populates="customer")
     destination: Mapped[str | None] = mapped_column(String(255))
 
@@ -64,7 +64,7 @@ class Order(Base):
     delivery_destination: Mapped[str | None] = mapped_column(String(255))
     estimated_delivery_minutes: Mapped[int | None] = mapped_column(Integer)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     customer: Mapped[Customer | None] = relationship(back_populates="orders")
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan")
 

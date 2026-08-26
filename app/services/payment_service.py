@@ -15,4 +15,4 @@ def create_payment(db: Session, payload: PaymentCreate) -> Payment:
 
 
 def mark_paid(payment: Payment) -> None:
-    if payment.status == PaymentStatus.paid: payment.paid_at = payment.paid_at or datetime.utcnow()
+    if payment.status == PaymentStatus.paid: payment.paid_at = payment.paid_at or datetime.now()
