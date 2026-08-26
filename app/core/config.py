@@ -3,12 +3,11 @@ from functools import lru_cache
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Settings(BaseSettings):
     app_name: str = "Restaurant API"
     # Set DATABASE_URL in .env. Example:
     # postgresql+psycopg://user:password@host:5432/restaurant
-    database_url: str = "postgresql+psycopg://restaurant:restaurant@localhost:5432/restaurant"
+    database_url: str = ""
     openrouter_api_key: str = ""
     openrouter_model: str = "openai/gpt-oss-20b"
     debug: bool = True

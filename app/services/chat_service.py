@@ -163,17 +163,6 @@ class ChatService:
         self.openrouter_model = os.getenv("OPENROUTER_MODEL") or settings.openrouter_model
         print(f"==>> ChatService init: api_key_set={bool(self.openrouter_api_key)} model={self.openrouter_model!r}")
 
-    # ------------------------------------------------------------------
-    # LLM-authored SQL helpers
-    #
-    # Nothing in this service builds INSERT/UPDATE/SELECT statements (or
-    # SQLAlchemy ORM objects) by hand anymore. Every database read or write
-    # is produced by asking the LLM to write the SQL for a specific task
-    # (using the same schema + rules as the general chat path), which is
-    # then executed with a plain text() call. Python only supplies the
-    # values that go into the task description and reads back rows using
-    # column aliases it explicitly told the LLM to use.
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _sql_escape(value: str | None) -> str:

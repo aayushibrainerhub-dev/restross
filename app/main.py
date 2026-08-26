@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from app.api import auth, chat, customers, orders, reservations, restaurants
+from app.api import chat, restaurants
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.db.database import Base, engine
@@ -33,7 +33,7 @@ async def read_root(request: Request):
         context={"title": settings.app_name}
     )
 
-for router in (auth.router, chat.router, restaurants.router, customers.router, orders.router, reservations.router):
+for router in (chat.router, restaurants.router):
     app.include_router(router, prefix=settings.api_prefix)
 
 

@@ -16,7 +16,7 @@ class OrderStatus(str, Enum):
 class ReservationStatus(str, Enum):
     booked = "booked"; seated = "seated"; completed = "completed"; cancelled = "cancelled"
 
-
+# no needed
 class User(Base):
     __tablename__ = "users"
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
@@ -78,7 +78,7 @@ class OrderItem(Base):
     unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     order: Mapped[Order] = relationship(back_populates="items")
 
-
+# no needed
 class Reservation(Base):
     __tablename__ = "reservations"
     id: Mapped[int] = mapped_column(primary_key=True)
