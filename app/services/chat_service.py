@@ -83,46 +83,69 @@ CRITICAL RULES:
 - Return ONLY JSON string, no markdown wrapping, no extra text, and NO <think> tags or reasoning steps.
 """
 
-def _clean_content(content: str) -> str:
+def _clean_content(content: str | None) -> str:
+    print(f"==>> _clean_content: called")
+    if not content:
+        return ""
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE)
     content = re.sub(r"<think>.*", "", content, flags=re.DOTALL | re.IGNORECASE)
     return content.strip()
 
 from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.stores import InMemoryStore as LangChainStore
 
-chat_sessions: dict[str, InMemoryChatMessageHistory] = {}
+_session_store = LangChainStore()
+_session_orders: dict[str, int] = {}
 
 def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
-    if session_id not in chat_sessions:
-        chat_sessions[session_id] = InMemoryChatMessageHistory()
-    return chat_sessions[session_id]
+    print(f"==>> get_session_history: {session_id}")
+    existing = _session_store.mget([session_id])[0]
+    if existing is None:
+        history = InMemoryChatMessageHistory()
+        _session_store.mset([(session_id, history)])
+        return history
+    return existing
 
 
-def _is_order_details_follow_up(history: InMemoryChatMessageHistory, message: str) -> bool:
-    """Identify contact details that complete an order from an earlier turn."""
-    prior_user_messages = [
-        str(item.content) for item in history.messages if item.type == "human"
-    ]
-    has_order_context = any(
-        re.search(r"\b(?:order|want|would like|get)\b.*\b(?:from|at)\b", item, re.IGNORECASE)
-        for item in prior_user_messages
-    )
-    has_contact_details = bool(re.search(
-        r"(?:\b\d{10}\b|[\w.+-]+@\w[\w.-]*\.[A-Za-z]{2,}|\bmy name is\b)",
-        message,
-        re.IGNORECASE,
-    ))
-    return has_order_context and has_contact_details
+# Moved to ChatService._is_order_details_follow_up (needs LLM access)
+
+
+def _parse_json_from_llm(raw: str) -> dict:
+    if not raw:
+        return {}
+    clean = raw.strip()
+    if "```" in clean:
+        parts = clean.split("```")
+        clean = " ".join(p for i, p in enumerate(parts) if i % 2 == 1 or len(parts) == 1).strip()
+    if clean.startswith("json"):
+        clean = clean[4:].strip()
+    s_idx = clean.find("{")
+    e_idx = clean.rfind("}")
+    if s_idx != -1 and e_idx != -1:
+        clean = clean[s_idx:e_idx + 1]
+    try:
+        return json.loads(clean)
+    except Exception:
+        return {}
 
 
 def _session_order_id(history: InMemoryChatMessageHistory) -> int | None:
+    print(f"==>> _session_order_id: called")
     """Return the most recently created order number acknowledged in this session."""
     for message in reversed(history.messages):
         if message.type != "ai":
             continue
-        match = re.search(r"(?:order number is|order)\s*#(\d+)", str(message.content), re.IGNORECASE)
-        if match:
-            return int(match.group(1))
+        content = str(message.content)
+        idx = content.find("#")
+        while idx != -1:
+            num = ""
+            i = idx + 1
+            while i < len(content) and content[i].isdigit():
+                num += content[i]
+                i += 1
+            if num:
+                return int(num)
+            idx = content.find("#", idx + 1)
     return None
 
 class ChatService:
@@ -134,7 +157,85 @@ class ChatService:
         )
         self.openrouter_model = os.getenv("OPENROUTER_MODEL") or settings.openrouter_model
 
+    def _is_order_details_follow_up(self, history: InMemoryChatMessageHistory, message: str) -> bool:
+        print(f"==>> _is_order_details_follow_up: called (LLM)")
+        """Use the LLM to decide whether the current message is providing
+        contact details that complete an in-progress order from earlier in
+        the conversation."""
+        if not history.messages:
+            return False
+
+        recent_turns = "\n".join(
+            f"{'User' if m.type == 'human' else 'Assistant'}: {m.content}"
+            for m in history.messages[-6:]
+        )
+        prompt = f"""\
+You are analysing a restaurant-ordering conversation.
+
+Previous turns:
+{recent_turns}
+
+New user message:
+{message}
+
+Answer with JSON only: {{"is_contact_follow_up": true}} if the new message
+supplies name, email, or phone number to complete a food order the user
+started in a prior turn, otherwise {{"is_contact_follow_up": false}}.
+Do NOT explain. Return JSON only."""
+        try:
+            raw = _clean_content(self._call_llm([
+                {"role": "system", "content": "You classify restaurant conversation intent. Return JSON only, no markdown."},
+                {"role": "user", "content": prompt},
+            ], max_tokens=60))
+            result = _parse_json_from_llm(raw)
+            return bool(result.get("is_contact_follow_up", False))
+        except Exception:
+            return False
+
+    def _classify_intent(
+        self, history: InMemoryChatMessageHistory, message: str, session_order_id: int | None
+    ) -> str:
+        """Ask the LLM what the user is trying to do.
+
+        Returns one of:
+          give_destination  – user is providing a delivery address
+          confirm_order     – user is confirming a pending order
+          delivery_status   – user wants delivery ETA / time remaining
+          add_item          – user wants to add more items to an existing order
+          contact_followup  – user is giving name/email/phone to complete an order
+          general           – anything else
+        """
+        print(f"==>> _classify_intent: called")
+        recent_turns = "\n".join(
+            f"{'User' if m.type == 'human' else 'Assistant'}: {m.content}"
+            for m in history.messages[-6:]
+        )
+        prompt = (
+            f"Conversation so far:\n{recent_turns}\n\n"
+            f"Latest user message: \"{message}\"\n"
+            f"Active order ID in this session: {session_order_id}\n\n"
+            "Classify the intent of the latest user message as EXACTLY one of:\n"
+            "- give_destination : user is providing a delivery address/location\n"
+            "- confirm_order    : user is confirming/approving a pending order\n"
+            "- delivery_status  : user asks about ETA, time left, order status\n"
+            "- add_item         : user wants to add more food to an existing order\n"
+            "- contact_followup : user is providing name/email/phone to complete a food order started earlier\n"
+            "- general          : anything else\n\n"
+            "Return JSON only: {\"intent\": \"<one of the above>\"}"
+        )
+        try:
+            raw = _clean_content(self._call_llm([
+                {"role": "system", "content": "You classify restaurant chatbot intent. Return JSON only, no markdown."},
+                {"role": "user", "content": prompt},
+            ], max_tokens=50))
+            intent = _parse_json_from_llm(raw).get("intent", "general")
+            valid = {"give_destination", "confirm_order", "delivery_status", "add_item", "contact_followup", "general"}
+            return intent if intent in valid else "general"
+        except Exception:
+            return "general"
+
     def _call_llm(self, messages: list[dict], max_tokens: int = 1200) -> str:
+        print(f"==>> _call_llm: called")
         if not self.openrouter_api_key:
             raise RuntimeError("OPENROUTER_AI_API_KEY is missing from environment variables.")
 
@@ -155,6 +256,7 @@ class ChatService:
             raise RuntimeError(f"OpenRouter request failed: {error}") from error
 
     def _execute_sql(self, sql_query: str, user_message: str, retried: bool = False) -> dict:
+        print(f"==>> _execute_sql: called")
         upper_sql = sql_query.strip().upper()
         allowed_verbs = ("SELECT", "INSERT", "UPDATE", "DELETE", "WITH")
 
@@ -212,8 +314,7 @@ The user requested: "{user_message}"
 Rows affected: {rowcount}{returned_info}
 
 Write a SHORT, FRIENDLY confirmation message (2-4 sentences max). 
-If an order_id was returned, show it prominently as "Your Order Number is #<id>".
-If the user requested food and an order_id was returned, ask them to provide their delivery destination so the order can be confirmed and a destination-specific ETA can be calculated.
+If the user requested food, ask them to provide their delivery destination so the order can be confirmed and a destination-specific ETA can be calculated. Do NOT reveal or display any order number yet (order numbers are displayed only after confirmation).
 STRICTLY FORBIDDEN in your response:
 - Any SQL code or queries
 - Table names (customers, orders, order_items, etc.)
@@ -281,11 +382,13 @@ CRITICAL INSTRUCTION: Do NOT include raw SQL, code blocks, or technical tracebac
                 "sql_query": sql_query
             }
 
-    def _create_order_from_llm(self, history: InMemoryChatMessageHistory, message: str) -> dict | None:
+    def _create_order_from_llm(self, history: InMemoryChatMessageHistory, message: str, session_id: str = "default_session") -> dict | None:
+        logger.info("[_create_order_from_llm] Called for session_id=%s, message=%r", session_id, message)
+        print(f"==>> _create_order_from_llm: called")
         """Let the LLM resolve order details from the conversation, then persist them safely."""
         conversation = "\n".join(
             f"{'User' if item.type == 'human' else 'Assistant'}: {item.content}"
-            for item in history.messages[-6:]
+            for item in history.messages[-12:]
         )
         extraction_prompt = f"""
 Extract one food order from this conversation, using the latest message to fill in
@@ -301,22 +404,28 @@ User: {message}
 """
         try:
             raw = _clean_content(self._call_llm([
-                {"role": "system", "content": "You extract restaurant-order data accurately. Return JSON only."},
+                {"role": "system", "content": "You extract restaurant-order data accurately. Return JSON only, no markdown."},
                 {"role": "user", "content": extraction_prompt},
             ], max_tokens=250))
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            extracted = json.loads(match.group(0) if match else raw)
-            customer_data = extracted["customer"]
-            order_data = extracted["order"]
-            full_name = customer_data["full_name"]
-            email = customer_data["email"]
-            phone = customer_data["phone"]
-            cafe = order_data["cafe"]
-            menu_item = order_data["menu_item"]
-            quantity = int(order_data["quantity"])
+            logger.info("[_create_order_from_llm] Raw LLM output: %r", raw)
+            extracted = _parse_json_from_llm(raw)
+            logger.info("[_create_order_from_llm] Parsed JSON: %s", extracted)
+            customer_data = extracted.get("customer", {})
+            order_data = extracted.get("order", {})
+            full_name = customer_data.get("full_name")
+            email = customer_data.get("email")
+            phone = customer_data.get("phone")
+            cafe = order_data.get("cafe")
+            menu_item = order_data.get("menu_item")
+            quantity = int(order_data.get("quantity") or 1)
+            
+            logger.info("[_create_order_from_llm] Extracted fields: name=%s, email=%s, phone=%s, cafe=%s, item=%s, qty=%s",
+                        full_name, email, phone, cafe, menu_item, quantity)
             if not all(isinstance(value, str) and value.strip() for value in (full_name, email, phone, cafe, menu_item)) or quantity < 1:
+                logger.warning("[_create_order_from_llm] Missing or invalid required fields.")
                 return None
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
+        except Exception as err:
+            logger.error("[_create_order_from_llm] Exception during extraction: %s", err, exc_info=True)
             return None
 
         restaurant = self.db.scalar(
@@ -325,16 +434,34 @@ User: {message}
             .where(Restaurant.menu_item.ilike(f"%{menu_item.strip()}%"))
             .limit(1)
         )
+        if restaurant is None:
+            restaurant = self.db.scalar(
+                select(Restaurant)
+                .where(Restaurant.menu_item.ilike(f"%{menu_item.strip()}%"))
+                .limit(1)
+            )
         if restaurant is None or restaurant.price_inr is None:
+            logger.warning("[_create_order_from_llm] Restaurant/menu item not found: cafe=%s, item=%s", cafe, menu_item)
             return None
 
-        customer = self.db.scalar(select(Customer).where(Customer.email == email.strip()).limit(1))
-        if customer is None:
-            customer = self.db.scalar(select(Customer).where(Customer.phone == phone.strip()).limit(1))
-        if customer is None:
+        customer = self.db.scalar(select(Customer).where((Customer.email == email.strip()) | (Customer.phone == phone.strip())).limit(1))
+        if customer:
+            customer.full_name = full_name.strip()
+            customer.email = email.strip()
+            customer.phone = phone.strip()
+        else:
             customer = Customer(full_name=full_name.strip(), email=email.strip(), phone=phone.strip())
             self.db.add(customer)
+        
+        try:
             self.db.flush()
+        except Exception as err:
+            logger.warning("[_create_order_from_llm] Flush customer failed: %s, rolling back", err)
+            self.db.rollback()
+            customer = self.db.scalar(select(Customer).where((Customer.email == email.strip()) | (Customer.phone == phone.strip())).limit(1))
+            if not customer:
+                logger.error("[_create_order_from_llm] Could not save or find customer record.")
+                return None
 
         order = Order(
             restaurant_id=restaurant.id,
@@ -351,15 +478,20 @@ User: {message}
             unit_price=restaurant.price_inr,
         ))
         self.db.commit()
+
+        _session_orders[session_id] = order.id
+        logger.info("[_create_order_from_llm] Successfully created Order #%s for customer %s (session_id=%s)", order.id, customer.full_name, session_id)
         return {
             "response": (
-                f"Your order has been created. Your Order Number is #{order.id}. "
-                "Please provide your delivery destination so I can calculate the delivery estimate."
+                "✅ Great! Your order details have been saved."
+                "\n\n🛵 Please share your **delivery destination** (area/address in Ahmedabad) "
+                "so I can calculate an accurate delivery estimate for you."
             ),
             "sql_query": None,
         }
 
     def _add_item_from_llm(self, history: InMemoryChatMessageHistory, message: str, session_order_id: int | None) -> dict | None:
+        print(f"==>> _add_item_from_llm: called")
         """Use the LLM to identify an item change, then persist it transactionally."""
         prompt = f"""
 Extract an item addition from the user's restaurant-order conversation. Return JSON only:
@@ -369,17 +501,16 @@ User request: {message}
 """
         try:
             raw = _clean_content(self._call_llm([
-                {"role": "system", "content": "You extract order modifications accurately. Return JSON only."},
+                {"role": "system", "content": "You extract order modifications accurately. Return JSON only, no markdown."},
                 {"role": "user", "content": prompt},
             ], max_tokens=150))
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            data = json.loads(match.group(0) if match else raw)
-            order_id = int(data["order_id"] or session_order_id)
-            menu_item = data["menu_item"]
-            quantity = int(data["quantity"])
+            data = _parse_json_from_llm(raw)
+            order_id = int(data.get("order_id") or session_order_id)
+            menu_item = data.get("menu_item")
+            quantity = int(data.get("quantity") or 1)
             if not isinstance(menu_item, str) or not menu_item.strip() or quantity < 1:
                 return None
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
+        except (KeyError, TypeError, ValueError, RuntimeError):
             return None
 
         order = self.db.get(Order, order_id)
@@ -407,13 +538,14 @@ User request: {message}
         self.db.commit()
         return {
             "response": (
-                f"Added {quantity} {restaurant_item.menu_item} to order #{order.id}. "
+                f"Added {quantity} {restaurant_item.menu_item} to your order. "
                 f"Your updated total is ₹{order.total_amount}."
             ),
             "sql_query": None,
         }
 
     def _latest_active_order(self, order_id: int | None = None) -> tuple[Order, Restaurant] | None:
+        print(f"==>> _latest_active_order: called")
         """Return the latest order that can still be delivered in this demo app."""
         statement = (
             select(Order, Restaurant)
@@ -427,6 +559,7 @@ User request: {message}
         return self.db.execute(statement).first()
 
     def _estimate_delivery_minutes(self, cafe_location: str, destination: str) -> int | None:
+        print("==>> _estimate_delivery_minutes: called")
         """Ask the LLM for an estimate using the actual café and destination fields."""
         estimate_prompt = f"""
 Estimate a realistic food-delivery travel time in minutes using the café location and
@@ -440,16 +573,16 @@ Return JSON only: {{"eta_minutes": <whole number between 1 and 180>}}
 """
         try:
             raw = _clean_content(self._call_llm([
-                {"role": "system", "content": "You estimate restaurant delivery travel times. Return JSON only."},
+                {"role": "system", "content": "You estimate restaurant delivery travel times. Return JSON only, no markdown."},
                 {"role": "user", "content": estimate_prompt},
             ]))
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            eta = int(json.loads(match.group(0) if match else raw).get("eta_minutes"))
+            eta = int(_parse_json_from_llm(raw).get("eta_minutes", 0))
             return eta if 1 <= eta <= 180 else None
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError):
             return None
 
     def _save_destination(self, destination: str, order_id: int | None = None) -> dict:
+        print(f"==>> _save_destination: called")
         active_order = self._latest_active_order(order_id)
         if not active_order:
             return {
@@ -457,18 +590,33 @@ Return JSON only: {{"eta_minutes": <whole number between 1 and 180>}}
                 "sql_query": None,
             }
 
-        order, _ = active_order
+        order, restaurant = active_order
         order.delivery_destination = destination
         self.db.commit()
+
+        # Build an itemized bill to show before asking for confirmation
+        items = order.items  # already loaded via relationship
+        bill_lines = []
+        for item in items:
+            bill_lines.append(
+                f"  • {item.item_name} × {item.quantity} — ₹{float(item.unit_price) * item.quantity:.2f}"
+            )
+        bill_text = "\n".join(bill_lines) if bill_lines else "  (no items found)"
+
+        response = (
+            f"📍 Delivery destination set to **{destination}**."
+            f"\n\n🧾 **Order Summary** (from {restaurant.cafe}):"
+            f"\n{bill_text}"
+            f"\n\n💰 **Total: ₹{float(order.total_amount):.2f}**"
+            f"\n\nType **CONFIRM** to place your order."
+        )
         return {
-            "response": (
-                f"Delivery destination saved: {destination}. "
-                f"Type CONFIRM to place your order."
-            ),
+            "response": response,
             "sql_query": None,
         }
 
     def _confirm_latest_order(self, order_id: int | None = None) -> dict:
+        print(f"==>> _confirm_latest_order: called")
         active_order = self._latest_active_order(order_id)
         if not active_order:
             return {"response": "I couldn't find an active order to confirm.", "sql_query": None}
@@ -483,7 +631,10 @@ Return JSON only: {{"eta_minutes": <whole number between 1 and 180>}}
         eta_minutes = self._estimate_delivery_minutes(restaurant.location, order.delivery_destination)
         if eta_minutes is None:
             return {
-                "response": "I couldn't calculate a delivery estimate for that destination. Please provide a more specific address or locality.",
+                "response": (
+                    "I couldn't calculate a delivery estimate for that destination. "
+                    "Please provide a more specific area or locality in Ahmedabad."
+                ),
                 "sql_query": None,
             }
 
@@ -491,191 +642,160 @@ Return JSON only: {{"eta_minutes": <whole number between 1 and 180>}}
         order.confirmed_at = datetime.utcnow()
         order.status = OrderStatus.confirmed
         self.db.commit()
+
+        # Build itemized bill for confirmation message
+        items = order.items
+        bill_lines = []
+        for item in items:
+            bill_lines.append(
+                f"  • {item.item_name} × {item.quantity} — ₹{float(item.unit_price) * item.quantity:.2f}"
+            )
+        bill_text = "\n".join(bill_lines) if bill_lines else "  (no items)"
+
         return {
             "response": (
-                f"Your order has been confirmed. Your Order Number is #{order.id}. "
-                f"Delivery to {order.delivery_destination} is estimated at about {eta_minutes} minutes."
+                f"🎉 Order **#{order.id}** confirmed!"
+                f"\n\n🧾 **Bill Summary:**"
+                f"\n{bill_text}"
+                f"\n💰 **Total: ₹{float(order.total_amount):.2f}**"
+                f"\n\n🛵 Delivering to **{order.delivery_destination}**."
+                f"\n⏱ Estimated delivery time: **~{eta_minutes} minutes**."
+                f"\n\nYou can ask *'how much time is left?'* anytime to check your remaining delivery time."
             ),
             "sql_query": None,
         }
 
     def _delivery_status(self, order_id: int | None = None) -> dict:
+        print(f"==>> _delivery_status: called")
         active_order = self._latest_active_order(order_id)
         if not active_order:
+            # Also try to find recently completed orders
             return {"response": "I couldn't find an active order.", "sql_query": None}
 
         order, _ = active_order
         if not order.delivery_destination or not order.estimated_delivery_minutes or not order.confirmed_at:
             return {
-                "response": "Please provide your delivery destination first so I can calculate your delivery estimate.",
+                "response": (
+                    "Your order hasn't been confirmed with a destination yet. "
+                    "Please provide your delivery destination so I can calculate your delivery estimate."
+                ),
                 "sql_query": None,
             }
 
-        elapsed_minutes = max(0, int((datetime.utcnow() - order.confirmed_at).total_seconds() // 60))
+        elapsed_seconds = (datetime.utcnow() - order.confirmed_at).total_seconds()
+        elapsed_minutes = max(0, int(elapsed_seconds // 60))
         remaining_minutes = max(0, order.estimated_delivery_minutes - elapsed_minutes)
+
         if remaining_minutes == 0:
             order.status = OrderStatus.completed
             self.db.commit()
             return {
-                "response": "Your order has been delivered successfully. Enjoy your meal!",
+                "response": (
+                    f"🎉 Your order **#{order.id}** has been delivered to **{order.delivery_destination}**! "
+                    "Enjoy your meal! 🍽️"
+                ),
                 "sql_query": None,
             }
 
+        elapsed_display = f"{elapsed_minutes} minute{'s' if elapsed_minutes != 1 else ''}" if elapsed_minutes > 0 else "less than a minute"
         return {
             "response": (
-                f"Your order is on the way to {order.delivery_destination}. "
-                f"Estimated time remaining: about {remaining_minutes} minutes."
+                f"🛵 Your order **#{order.id}** is on the way to **{order.delivery_destination}**!"
+                f"\n⏱ Time elapsed: {elapsed_display}"
+                f"\n⏳ Estimated time remaining: **~{remaining_minutes} minute{'s' if remaining_minutes != 1 else ''}**."
             ),
             "sql_query": None,
         }
 
     def process_query(self, user_message: str, session_id: str = "default_session") -> dict:
-        # A copied JSON value can contain an escaped at-sign. Store and use the
-        # actual email address so it is not persisted with a stray backslash.
+        print(f"==>> process_query: called, session_id={session_id}")
+        logger.info("[PROCESS_QUERY] Called with session_id=%s, user_message=%r", session_id, user_message)
         user_message = user_message.replace(r"\@", "@")
         history = get_session_history(session_id)
-        session_order_id = _session_order_id(history)
-        order_details_follow_up = _is_order_details_follow_up(history, user_message)
 
-        last_message = history.messages[-1] if history.messages else None
-        awaiting_destination = bool(
-            last_message
-            and last_message.type == "ai"
-            and "provide your delivery destination" in str(last_message.content).lower()
-        )
-        # An LLM response can ask for a destination before an order was actually
-        # inserted. Do not consume the next message as an address in that case:
-        # it would otherwise leave the session stuck with no order to update.
-        if awaiting_destination and self._latest_active_order(session_order_id):
-            destination_result = self._save_destination(user_message.strip(), session_order_id)
+        session_order_id = _session_orders.get(session_id) or _session_order_id(history)
+        logger.info("[PROCESS_QUERY] Resolved session_order_id=%s for session_id=%s", session_order_id, session_id)
+
+        # ── Single LLM intent classifier — no more string-matching on AI messages ──
+        intent = self._classify_intent(history, user_message, session_order_id)
+        logger.info("[PROCESS_QUERY] Intent classified as '%s' (session_order_id=%s)", intent, session_order_id)
+        print(f"==>> intent: {intent}  order_id: {session_order_id}")
+
+        result: dict | None = None
+
+        # 1. User is giving a delivery address for an existing order
+        if intent == "give_destination" and session_order_id:
+            result = self._save_destination(user_message.strip(), session_order_id)
+
+        # 2. User is confirming the order
+        elif intent == "confirm_order" and session_order_id:
+            result = self._confirm_latest_order(session_order_id)
+
+        # 3. User wants delivery ETA / time left
+        elif intent == "delivery_status":
+            result = self._delivery_status(session_order_id)
+
+        # 4. User wants to add more items to an existing order
+        elif intent == "add_item" and session_order_id:
+            result = self._add_item_from_llm(history, user_message, session_order_id)
+
+        # 5. User is providing contact details to complete an order
+        elif intent == "contact_followup":
+            result = self._create_order_from_llm(history, user_message, session_id)
+
+        # 6. Active pending order exists without a destination: process user input as destination
+        elif session_order_id:
+            order_pair = self._latest_active_order(session_order_id)
+            if order_pair and order_pair[0].status == OrderStatus.pending and not order_pair[0].delivery_destination:
+                result = self._save_destination(user_message.strip(), session_order_id)
+
+        # ── If a structured handler produced a result, return it ──
+        if result:
+            logger.info("[PROCESS_QUERY] Handler produced response: %r", result["response"])
             history.add_user_message(user_message)
-            history.add_ai_message(destination_result["response"])
-            return destination_result
+            history.add_ai_message(result["response"])
+            return result
 
-        awaiting_confirmation = bool(
-            last_message
-            and last_message.type == "ai"
-            and "type confirm to place your order" in str(last_message.content).lower()
-        )
-        if awaiting_confirmation and re.fullmatch(r"\s*(?:yes,?\s+)?confirm\s*[.!]?\s*", user_message, re.IGNORECASE):
-            confirmation_result = self._confirm_latest_order(session_order_id)
-            history.add_user_message(user_message)
-            history.add_ai_message(confirmation_result["response"])
-            return confirmation_result
-
-        if re.search(r"\b(?:add|include)\b", user_message, re.IGNORECASE):
-            updated_order = self._add_item_from_llm(history, user_message, session_order_id)
-            if updated_order:
-                history.add_user_message(user_message)
-                history.add_ai_message(updated_order["response"])
-                return updated_order
-
-        if re.search(
-            r"\b(?:order\s+status|delivery\s+(?:time|status|eta)|eta|where(?:'s| is) my order|"
-            r"when will.*(?:arrive|reach)|how (?:much|long).*(?:deli\w*|order)|"
-            r"how much time (?:is )?left|approx(?:imate)?\s+(?:delivery\s+)?(?:time|timing).*(?:reach|arrive))\b",
-            user_message,
-            re.IGNORECASE,
-        ):
-            status_result = self._delivery_status(session_order_id)
-            history.add_user_message(user_message)
-            history.add_ai_message(status_result["response"])
-            return status_result
-
-        if order_details_follow_up:
-            created_order = self._create_order_from_llm(history, user_message)
-            if created_order:
-                history.add_user_message(user_message)
-                history.add_ai_message(created_order["response"])
-                return created_order
-        
+        # ── General path: ask the DB-schema LLM ──
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         dynamic_prompt = DB_SCHEMA_PROMPT + f"\n\nCURRENT SYSTEM TIME: {current_time}\n"
-        if order_details_follow_up:
-            dynamic_prompt += (
-                "\n- The latest user message provides contact details for an order requested "
-                "earlier in this session. Generate the complete order SQL now, using the "
-                "item, quantity, and café from the earlier user message and the customer "
-                "details from the latest one."
-            )
-        
+
         messages = [{"role": "system", "content": dynamic_prompt}]
         for msg in history.messages[-8:]:
             role = "user" if msg.type == "human" else "assistant"
             messages.append({"role": role, "content": msg.content})
-            
         messages.append({"role": "user", "content": user_message})
 
         try:
             llm_output = self._call_llm(messages)
-        except RuntimeError as error:
-            logger.warning("Chat request could not reach any configured LLM: %s", error)
-            final_response = "The ordering assistant is temporarily busy. Please try again in a few minutes."
+            logger.info("[GENERAL_PATH] Raw LLM output: %r", llm_output)
+        except Exception as error:
+            logger.error("[GENERAL_PATH] LLM request failed: %s", error, exc_info=True)
+            resp = "The ordering assistant is temporarily busy. Please try again in a few minutes."
             history.add_user_message(user_message)
-            history.add_ai_message(final_response)
-            return {"response": final_response, "sql_query": None}
+            history.add_ai_message(resp)
+            return {"response": resp, "sql_query": None}
+
         cleaned_output = _clean_content(llm_output)
-        
-        # Extract JSON object from anywhere in the LLM output
-        json_match = re.search(r"\{.*\}", cleaned_output, re.DOTALL)
-        clean_json = json_match.group(0) if json_match else cleaned_output
-        
-        try:
-            parsed = json.loads(clean_json)
-        except json.JSONDecodeError:
-            # Never send incomplete internal JSON/SQL to the chat UI. It can
-            # happen when a model response is cut off before its closing brace.
-            is_incomplete_sql_payload = bool(re.match(
-                r'\s*\{.*?["\']sql["\']\s*:', cleaned_output, re.DOTALL
-            ))
-            parsed = {
-                "sql": None,
-                "explanation": "" if is_incomplete_sql_payload else cleaned_output,
-            }
+        parsed = _parse_json_from_llm(cleaned_output)
+        logger.info("[GENERAL_PATH] Cleaned output: %r | Parsed: %s", cleaned_output, parsed)
+
+        if not parsed:
+            is_incomplete = '"sql"' in cleaned_output or "'sql'" in cleaned_output
+            parsed = {"sql": None, "explanation": "" if is_incomplete else cleaned_output}
 
         sql_query = parsed.get("sql")
         explanation = parsed.get("explanation", "")
 
-        # A malformed or evasive first response must not be presented as the
-        # generic greeting for a request that plainly needs database data.
-        needs_database_query = bool(re.search(
-            r"\b(menu|order|reservation|book|status|delivery|restaurant|restaurants|cafe|café|cafes|cafés)\b",
-            user_message,
-            flags=re.IGNORECASE,
-        )) or order_details_follow_up
-        if not sql_query and needs_database_query:
-            retry_prompt = (
-                "The previous response was incomplete or did not contain usable SQL. The user's latest message "
-                "is a restaurant database request, so return JSON with a non-null SQL "
-                "query whenever its requested data can be queried. In particular, a menu "
-                "request must use a SELECT query against restaurants. If the latest message "
-                "contains customer details for an earlier order, combine those messages and "
-                "create a pending order and its items now. Do not ask for a delivery "
-                "destination until after that order has been created. Return JSON only."
-            )
-            try:
-                retry_output = self._call_llm(messages + [{"role": "user", "content": retry_prompt}])
-            except RuntimeError:
-                retry_output = ""
-            retry_cleaned = _clean_content(retry_output)
-            retry_match = re.search(r"\{.*\}", retry_cleaned, re.DOTALL)
-            try:
-                retry_parsed = json.loads(retry_match.group(0) if retry_match else retry_cleaned)
-                sql_query = retry_parsed.get("sql")
-                explanation = retry_parsed.get("explanation", explanation)
-            except json.JSONDecodeError:
-                pass
-
         if not sql_query:
             final_response = explanation or "I couldn't complete that request just yet. Please try again in a moment."
+            logger.info("[GENERAL_PATH] No SQL query found. Returning final_response: %r", final_response)
             history.add_user_message(user_message)
             history.add_ai_message(final_response)
-            return {
-                "response": final_response,
-                "sql_query": None
-            }
+            return {"response": final_response, "sql_query": None}
 
         final_result = self._execute_sql(sql_query, user_message)
+        logger.info("[GENERAL_PATH] Executed SQL result: %r", final_result)
         history.add_user_message(user_message)
         history.add_ai_message(final_result["response"])
         return final_result

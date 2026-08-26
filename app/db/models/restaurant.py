@@ -50,6 +50,7 @@ class Customer(Base):
     email: Mapped[str | None] = mapped_column(String(255), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     orders: Mapped[list["Order"]] = relationship(back_populates="customer")
+    destination: Mapped[str | None] = mapped_column(String(255))
 
 
 class Order(Base):
