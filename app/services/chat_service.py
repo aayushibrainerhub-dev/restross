@@ -4,11 +4,12 @@ import os
 import re
 import httpx
 from datetime import datetime
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from app.core.config import get_settings
-from app.db.models.restaurant import Customer, Order, OrderItem, OrderStatus, Restaurant
 import dotenv
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.stores import InMemoryStore as LangChainStore
 dotenv.load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,12 @@ Return JSON ONLY:
 - If the user is just saying hello or asking a general non-database question, return JSON ONLY:
 {"sql": null, "explanation": "<friendly greeting or conversation>"}
 
+When asked to write SQL for a specific internal application task (rather than
+directly answering a user's chat message), the same rules above still apply:
+use CTEs for multi-table writes, never use placeholders, resolve foreign keys
+via subqueries, and follow any column-aliasing instructions in the task
+exactly, since the application code reads the result by those alias names.
+
 CRITICAL RULES:
 - ALWAYS use CTEs (WITH clause) when inserting across multiple tables (e.g. customers, orders, order_items, reservations) so ALL affected tables are updated together.
 - When creating a new order, the CTE's INSERT INTO orders statement MUST end with `RETURNING id`. Then add a final `SELECT id AS order_id FROM new_order` at the end of the CTE so the order ID is returned.
@@ -91,8 +98,6 @@ def _clean_content(content: str | None) -> str:
     content = re.sub(r"<think>.*", "", content, flags=re.DOTALL | re.IGNORECASE)
     return content.strip()
 
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.stores import InMemoryStore as LangChainStore
 
 _session_store = LangChainStore()
 _session_orders: dict[str, int] = {}
@@ -107,15 +112,13 @@ def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
     return existing
 
 
-# Moved to ChatService._is_order_details_follow_up (needs LLM access)
-
-
 def _parse_json_from_llm(raw: str) -> dict:
     if not raw:
         return {}
     clean = raw.strip()
     if "```" in clean:
         parts = clean.split("```")
+        print(f"==>> parts: {parts}")
         clean = " ".join(p for i, p in enumerate(parts) if i % 2 == 1 or len(parts) == 1).strip()
     if clean.startswith("json"):
         clean = clean[4:].strip()
@@ -126,6 +129,7 @@ def _parse_json_from_llm(raw: str) -> dict:
     try:
         return json.loads(clean)
     except Exception:
+        print(f"==>> Failed to parse JSON: {clean}")
         return {}
 
 
@@ -148,6 +152,7 @@ def _session_order_id(history: InMemoryChatMessageHistory) -> int | None:
             idx = content.find("#", idx + 1)
     return None
 
+
 class ChatService:
     def __init__(self, db: Session):
         self.db = db
@@ -156,6 +161,94 @@ class ChatService:
             or settings.openrouter_api_key
         )
         self.openrouter_model = os.getenv("OPENROUTER_MODEL") or settings.openrouter_model
+        print(f"==>> ChatService init: api_key_set={bool(self.openrouter_api_key)} model={self.openrouter_model!r}")
+
+    # ------------------------------------------------------------------
+    # LLM-authored SQL helpers
+    #
+    # Nothing in this service builds INSERT/UPDATE/SELECT statements (or
+    # SQLAlchemy ORM objects) by hand anymore. Every database read or write
+    # is produced by asking the LLM to write the SQL for a specific task
+    # (using the same schema + rules as the general chat path), which is
+    # then executed with a plain text() call. Python only supplies the
+    # values that go into the task description and reads back rows using
+    # column aliases it explicitly told the LLM to use.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sql_escape(value: str | None) -> str:
+        """Double up single quotes before a value is embedded in a SQL-writing
+        task prompt. This is a best-effort mitigation so the LLM's literal
+        comes out valid — it is not a substitute for parameterized queries,
+        which this architecture intentionally does not use (see
+        CRITICAL_RULES in DB_SCHEMA_PROMPT)."""
+        if not value:
+            return value or ""
+        return value.replace("'", "''")
+
+    def _generate_sql(self, task: str) -> tuple[str | None, str]:
+        """Ask the LLM to write the SQL for a specific internal task."""
+        raw = _clean_content(self._call_llm([
+            {"role": "system", "content": DB_SCHEMA_PROMPT},
+            {"role": "user", "content": task},
+        ]))
+        parsed = _parse_json_from_llm(raw)
+        return parsed.get("sql"), parsed.get("explanation", "")
+
+    def _run_sql(self, sql: str) -> list[dict]:
+        """Execute a single LLM-authored SQL statement and return its rows
+        (empty list for statements with no result set). Mutating statements
+        are committed; raises on failure so the caller can retry/handle it."""
+        upper_sql = sql.strip().upper()
+        is_select_type = upper_sql.startswith("SELECT") or (
+            upper_sql.startswith("WITH")
+            and "RETURNING" not in upper_sql
+            and not any(f" {kw} " in f" {upper_sql} " for kw in ("INSERT", "UPDATE", "DELETE"))
+        )
+        result = self.db.execute(text(sql))
+        try:
+            rows = [dict(zip(result.keys(), row)) for row in result.fetchall()]
+        except Exception:
+            rows = []
+        if not is_select_type:
+            self.db.commit()
+        return rows
+
+    def _generate_and_run(self, task: str) -> list[dict] | None:
+        """Generate SQL for `task` and execute it. On failure, feeds the
+        error back to the LLM once for a fix before giving up. Returns None
+        only when no SQL could be produced/executed at all."""
+        sql, _ = self._generate_sql(task)
+        if not sql:
+            logger.warning("[_generate_and_run] LLM returned no SQL for task: %s", task)
+            return None
+        try:
+            return self._run_sql(sql)
+        except Exception as err:
+            self.db.rollback()
+            logger.warning("[_generate_and_run] SQL failed (%s), asking LLM to fix: %s", err, sql)
+            fix_task = (
+                f"{task}\n\nThe SQL you previously wrote:\n{sql}\n\n"
+                f"failed with database error:\n{err}\n\n"
+                "Fix it. Remember: no placeholders like $1/?/:param — literal values only."
+            )
+            sql2, _ = self._generate_sql(fix_task)
+            if not sql2:
+                return None
+            try:
+                return self._run_sql(sql2)
+            except Exception as err2:
+                self.db.rollback()
+                logger.error("[_generate_and_run] Retry also failed: %s", err2)
+                return None
+
+    def _order_items(self, order_id: int) -> list[dict]:
+        task = f"""
+Write a SELECT that returns every row in order_items belonging to the order
+with id = {order_id}.
+Alias the returned columns EXACTLY as: item_name, quantity, unit_price.
+"""
+        return self._generate_and_run(task) or []
 
     def _is_order_details_follow_up(self, history: InMemoryChatMessageHistory, message: str) -> bool:
         print(f"==>> _is_order_details_follow_up: called (LLM)")
@@ -259,14 +352,30 @@ Do NOT explain. Return JSON only."""
                 response = client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={"Authorization": f"Bearer {self.openrouter_api_key}", "Content-Type": "application/json", "X-OpenRouter-Title": "Restros"},
-                    json={"model": self.openrouter_model, "messages": messages, "temperature": 0.1, "max_tokens": max_tokens},
+                    json={
+                        "model": self.openrouter_model,
+                        "messages": messages,
+                        "temperature": 0.1,
+                        "max_tokens": max_tokens,
+                        # Reasoning models (e.g. gpt-oss) spend tokens on hidden
+                        # "thinking" before writing the visible answer. Without
+                        # capping/excluding that, a modest max_tokens gets fully
+                        # consumed by reasoning and `content` comes back empty
+                        # or None - this keeps tokens available for the actual
+                        # answer. Harmless no-op for non-reasoning models.
+                        "reasoning": {"effort": "low", "exclude": True},
+                    },
                 )
             if response.status_code == 200:
-                return _clean_content(response.json()["choices"][0]["message"]["content"])
+                message = response.json()["choices"][0]["message"]
+                content = message.get("content") or message.get("reasoning") or ""
+                return _clean_content(content)
             error = f"OpenRouter API Error {response.status_code}: {response.text}"
+            print(f"==>> _call_llm: {error}")
             logger.warning("OpenRouter model %s failed: %s", self.openrouter_model, error)
             raise RuntimeError(error)
         except httpx.HTTPError as error:
+            print(f"==>> _call_llm: HTTP error: {error}")
             logger.warning("OpenRouter request failed: %s", error)
             raise RuntimeError(f"OpenRouter request failed: {error}") from error
 
@@ -283,12 +392,10 @@ Do NOT explain. Return JSON only."""
 
         try:
             is_select_type = upper_sql.startswith("SELECT") or (upper_sql.startswith("WITH") and "RETURNING" not in upper_sql and "INSERT" not in upper_sql and "UPDATE" not in upper_sql and "DELETE" not in upper_sql)
-            
+
             if is_select_type:
-                result = self.db.execute(text(sql_query))
-                keys = result.keys()
-                rows = [dict(zip(keys, row)) for row in result.fetchall()]
-                
+                rows = self._run_sql(sql_query)
+
                 synthesis_prompt = f"""
 The user asked: "{user_message}"
 Query Result Data ({len(rows)} rows):
@@ -304,21 +411,14 @@ CRITICAL INSTRUCTION: Do NOT include SQL queries, reasoning steps, code blocks, 
                 ]
                 final_response = _clean_content(self._call_llm(synth_messages))
                 final_response = re.sub(r"```.*?```", "", final_response, flags=re.DOTALL).strip()
-                
+
                 return {
                     "response": final_response,
                     "sql_query": sql_query
                 }
             else:
-                result = self.db.execute(text(sql_query))
-                
-                try:
-                    returned_rows = [dict(zip(result.keys(), row)) for row in result.fetchall()]
-                except Exception:
-                    returned_rows = []
-
-                self.db.commit()
-                rowcount = result.rowcount
+                returned_rows = self._run_sql(sql_query)
+                rowcount = len(returned_rows)
 
                 returned_info = ""
                 if returned_rows:
@@ -400,7 +500,8 @@ CRITICAL INSTRUCTION: Do NOT include raw SQL, code blocks, or technical tracebac
     def _create_order_from_llm(self, history: InMemoryChatMessageHistory, message: str, session_id: str = "default_session") -> dict | None:
         logger.info("[_create_order_from_llm] Called for session_id=%s, message=%r", session_id, message)
         print(f"==>> _create_order_from_llm: called")
-        """Let the LLM resolve customer and order details from the conversation history."""
+        """Let the LLM resolve customer + order details from the conversation,
+        then let the LLM write the SQL that actually creates them."""
         conversation = "\n".join(
             f"{'User' if item.type == 'human' else 'Assistant'}: {item.content}"
             for item in history.messages[-12:]
@@ -432,19 +533,19 @@ User: {message}
             logger.info("[_create_order_from_llm] Raw LLM output: %r", raw)
             extracted = _parse_json_from_llm(raw)
             logger.info("[_create_order_from_llm] Parsed JSON: %s", extracted)
-            
+
             customer_data = extracted.get("customer") or {}
             order_data = extracted.get("order") or {}
-            
+
             full_name = customer_data.get("full_name")
             email = customer_data.get("email")
             phone = customer_data.get("phone")
             cafe = order_data.get("cafe")
             raw_items = order_data.get("items") or []
-            
+
             if not raw_items and order_data.get("menu_item"):
                 raw_items = [{"menu_item": order_data.get("menu_item"), "quantity": order_data.get("quantity") or 1}]
-            
+
             if not (isinstance(full_name, str) and full_name.strip() and isinstance(email, str) and email.strip() and isinstance(phone, str) and phone.strip()):
                 logger.warning("[_create_order_from_llm] Missing customer contact details.")
                 return None
@@ -459,90 +560,59 @@ User: {message}
             logger.error("[_create_order_from_llm] Exception during extraction: %s", err, exc_info=True)
             return None
 
-        # Resolve restaurant items in database
-        resolved_items = []
-        primary_restaurant = None
-
-        for item in raw_items:
-            item_name = item.get("menu_item") if isinstance(item, dict) else str(item)
-            qty = int(item.get("quantity") or 1) if isinstance(item, dict) else 1
-            if not item_name or not isinstance(item_name, str):
-                continue
-            
-            sub_names = [s.strip() for s in item_name.split(",") if s.strip()]
-            for sub_name in sub_names:
-                restaurant = None
-                if cafe and isinstance(cafe, str) and cafe.strip():
-                    restaurant = self.db.scalar(
-                        select(Restaurant)
-                        .where(Restaurant.cafe.ilike(f"%{cafe.strip()}%"))
-                        .where(Restaurant.menu_item.ilike(f"%{sub_name}%"))
-                        .limit(1)
-                    )
-                if not restaurant:
-                    restaurant = self.db.scalar(
-                        select(Restaurant)
-                        .where(Restaurant.menu_item.ilike(f"%{sub_name}%"))
-                        .limit(1)
-                    )
-                if restaurant and restaurant.price_inr is not None:
-                    resolved_items.append((restaurant, qty))
-                    if not primary_restaurant:
-                        primary_restaurant = restaurant
-
-        if not resolved_items or not primary_restaurant:
-            logger.warning("[_create_order_from_llm] Could not resolve restaurant items.")
+        items_desc = "; ".join(
+            f"{int(it.get('quantity') or 1)} x {self._sql_escape(str(it.get('menu_item')))}"
+            for it in raw_items
+            if isinstance(it, dict) and it.get("menu_item")
+        )
+        if not items_desc:
             name_str = f", {full_name.strip()}" if full_name and isinstance(full_name, str) else ""
             return {
                 "response": f"Thanks{name_str}! Which café would you like to order from, and what menu items would you like?",
                 "sql_query": None,
             }
 
-        # Save or update Customer record
-        customer = self.db.scalar(select(Customer).where((Customer.email == email.strip()) | (Customer.phone == phone.strip())).limit(1))
-        if customer:
-            customer.full_name = full_name.strip()
-            customer.email = email.strip()
-            customer.phone = phone.strip()
-        else:
-            customer = Customer(full_name=full_name.strip(), email=email.strip(), phone=phone.strip())
-            self.db.add(customer)
-        
-        try:
-            self.db.flush()
-        except Exception as err:
-            logger.warning("[_create_order_from_llm] Flush customer failed: %s, rolling back", err)
-            self.db.rollback()
-            customer = self.db.scalar(select(Customer).where((Customer.email == email.strip()) | (Customer.phone == phone.strip())).limit(1))
-            if not customer:
-                logger.error("[_create_order_from_llm] Could not save customer record.")
-                return None
+        task = f"""
+Create a new pending order for this customer and these items.
 
-        total_amount = sum(rest.price_inr * q for rest, q in resolved_items)
+Customer full name: {self._sql_escape(full_name)}
+Customer email: {self._sql_escape(email)}
+Customer phone: {self._sql_escape(phone)}
+Café: {self._sql_escape(cafe) if cafe and isinstance(cafe, str) and cafe.strip() else "not specified — infer the single café whose menu best matches the items requested"}
+Items requested (quantity x menu item, as the user described it): {items_desc}
 
-        order = Order(
-            restaurant_id=primary_restaurant.id,
-            customer_id=customer.id,
-            status=OrderStatus.pending,
-            total_amount=total_amount,
-        )
-        self.db.add(order)
-        self.db.flush()
+Write a CTE that:
+1. Ensures the customer exists (do not use ON CONFLICT on full_name).
+2. For each requested item, resolves the exact menu_item name and price_inr
+   from restaurants by matching the café and using ILIKE against the
+   requested item text.
+3. Inserts the order into orders with status 'pending', the resolved
+   restaurant_id, the customer's id, and total_amount equal to the sum of
+   (unit price x quantity) across all resolved items.
+4. Inserts one row per resolved item into order_items with the resolved
+   item_name, quantity, and unit_price.
+If an item cannot be confidently matched to any café menu, skip that item
+rather than failing the whole order.
+The final statement of the CTE must be a SELECT returning the new order's id
+and the customer's full name, aliased EXACTLY as: order_id, customer_name.
+"""
+        rows = self._generate_and_run(task)
+        if not rows or not rows[0].get("order_id"):
+            logger.warning("[_create_order_from_llm] LLM SQL did not resolve items / create an order.")
+            name_str = f", {full_name.strip()}" if full_name else ""
+            return {
+                "response": f"Thanks{name_str}! Which café would you like to order from, and what menu items would you like?",
+                "sql_query": None,
+            }
 
-        for rest, q in resolved_items:
-            self.db.add(OrderItem(
-                order_id=order.id,
-                item_name=rest.menu_item,
-                quantity=q,
-                unit_price=rest.price_inr,
-            ))
-        self.db.commit()
+        order_id = rows[0]["order_id"]
+        customer_name = rows[0].get("customer_name") or full_name
 
-        _session_orders[session_id] = order.id
-        logger.info("[_create_order_from_llm] Successfully created Order #%s for customer %s (session_id=%s)", order.id, customer.full_name, session_id)
+        _session_orders[session_id] = order_id
+        logger.info("[_create_order_from_llm] Successfully created Order #%s for customer %s (session_id=%s)", order_id, customer_name, session_id)
         return {
             "response": (
-                f"Thanks, {customer.full_name}! 🛵 Please share your **delivery destination** (area/address in Ahmedabad) "
+                f"Thanks, {customer_name}! 🛵 Please share your **delivery destination** (area/address in Ahmedabad) "
                 "so I can prepare your order summary and calculate a delivery estimate for you."
             ),
             "sql_query": None,
@@ -550,7 +620,8 @@ User: {message}
 
     def _add_item_from_llm(self, history: InMemoryChatMessageHistory, message: str, session_order_id: int | None) -> dict | None:
         print(f"==>> _add_item_from_llm: called")
-        """Use the LLM to identify an item change, then persist it transactionally."""
+        """Use the LLM to identify the item change, then let the LLM write the
+        SQL that inserts the item and updates the order's total."""
         prompt = f"""
 Extract an item addition from the user's restaurant-order conversation. Return JSON only:
 {{"order_id": <integer or null>, "menu_item": "...", "quantity": <integer>}}
@@ -571,72 +642,248 @@ User request: {message}
         except (KeyError, TypeError, ValueError, RuntimeError):
             return None
 
-        order = self.db.get(Order, order_id)
-        if order is None:
+        task = f"""
+The user wants to add an item to an existing order.
+order id: {order_id}
+menu item requested: {self._sql_escape(menu_item.strip())}
+quantity: {quantity}
+
+Write a CTE that:
+1. Looks up the restaurant this order belongs to via orders.restaurant_id.
+2. Finds the matching row in restaurants for that same café where
+   menu_item ILIKE a pattern built from the requested item text, to get its
+   exact menu_item name and price_inr.
+3. Inserts one row into order_items for this order with that item_name,
+   quantity {quantity}, and the resolved unit_price.
+4. Updates orders.total_amount for this order id by adding
+   (resolved unit_price x {quantity}) to the existing total_amount.
+The final statement must be a SELECT returning the resolved item name and
+unit price, aliased EXACTLY as: item_name, unit_price.
+"""
+        rows = self._generate_and_run(task)
+        if not rows:
             return None
-        order_restaurant = self.db.get(Restaurant, order.restaurant_id)
-        if order_restaurant is None:
-            return None
-        restaurant_item = self.db.scalar(
-            select(Restaurant)
-            .where(Restaurant.cafe == order_restaurant.cafe)
-            .where(Restaurant.menu_item.ilike(f"%{menu_item.strip()}%"))
-            .limit(1)
-        )
-        if restaurant_item is None or restaurant_item.price_inr is None:
+        item_name = rows[0].get("item_name")
+        unit_price = rows[0].get("unit_price")
+        if not item_name or unit_price is None:
             return None
 
-        self.db.add(OrderItem(
-            order_id=order.id,
-            item_name=restaurant_item.menu_item,
-            quantity=quantity,
-            unit_price=restaurant_item.price_inr,
-        ))
-        order.total_amount += restaurant_item.price_inr * quantity
-        self.db.commit()
+        total_rows = self._generate_and_run(f"""
+Write a SELECT that returns total_amount for the orders row with id = {order_id}.
+Alias the column EXACTLY as: total_amount.
+""")
+        new_total = total_rows[0]["total_amount"] if total_rows else None
+
         return {
             "response": (
-                f"Added {quantity} {restaurant_item.menu_item} to your order. "
-                f"Your updated total is ₹{order.total_amount}."
+                f"Added {quantity} {item_name} to your order."
+                + (f" Your updated total is ₹{new_total}." if new_total is not None else "")
             ),
             "sql_query": None,
         }
 
-    def _latest_active_order(self, order_id: int | None = None) -> tuple[Order, Restaurant] | None:
+    def _latest_active_order(self, order_id: int | None = None) -> dict | None:
         print(f"==>> _latest_active_order: called")
-        """Return the latest order that can still be delivered in this demo app."""
-        statement = (
-            select(Order, Restaurant)
-            .join(Restaurant, Restaurant.id == Order.restaurant_id)
-            .where(Order.status.in_([OrderStatus.pending, OrderStatus.confirmed, OrderStatus.preparing]))
-            .order_by(Order.created_at.desc())
+        """Return the latest order (joined with its restaurant and, if any,
+        its customer) that can still be delivered in this demo app, via
+        LLM-authored SQL."""
+        scope = (
+            f"Restrict to the order with id = {order_id}."
+            if order_id
+            else "Do not filter by id; return only the single most recently created such order."
         )
-        if order_id is not None:
-            statement = statement.where(Order.id == order_id)
-        statement = statement.limit(1)
-        return self.db.execute(statement).first()
+        task = f"""
+Write a SELECT joining orders to restaurants (and LEFT JOIN customers on
+orders.customer_id, since customer_id may be null) that returns the latest
+order whose status is 'pending', 'confirmed', or 'preparing'.
+{scope}
+Alias the returned columns EXACTLY as: order_id, order_status, total_amount,
+delivery_destination, estimated_delivery_minutes, confirmed_at,
+restaurant_id, cafe, location, customer_id, customer_name, customer_email,
+customer_phone.
+Limit the result to 1 row.
+"""
+        rows = self._generate_and_run(task)
+        return rows[0] if rows else None
 
-    def _estimate_delivery_minutes(self, cafe_location: str, destination: str) -> int | None:
-        print("==>> _estimate_delivery_minutes: called")
-        """Ask the LLM to estimate travel time in minutes based on distance between cafe location and user destination."""
-        estimate_prompt = f"""
-Estimate a realistic food delivery time in minutes based on the distance between the café location and the customer's destination in Ahmedabad.
-Consider geographical distance within Ahmedabad, typical city traffic, and preparation time.
+    def _extract_contact_details(self, history: InMemoryChatMessageHistory, message: str) -> dict | None:
+        print(f"==>> _extract_contact_details: called")
+        """Ask the LLM to pull a full name, email, and phone number out of
+        the recent conversation + latest message. Returns None unless all
+        three are present."""
+        recent_turns = "\n".join(
+            f"{'User' if m.type == 'human' else 'Assistant'}: {m.content}"
+            for m in history.messages[-6:]
+        )
+        prompt = f"""
+Extract the customer's contact details from this restaurant-ordering
+conversation. These are sometimes split across messages, so consider the
+recent turns together with the new message.
 
-Café location: {cafe_location}
-Customer destination: {destination}
+Recent turns:
+{recent_turns}
 
-Return JSON only: {{"eta_minutes": <whole number between 15 and 90>}}
+New user message:
+{message}
+
+Return JSON only: {{"full_name": "...", "email": "...", "phone": "..."}}
+Use null for any field that truly isn't present. Do not invent values.
 """
         try:
             raw = _clean_content(self._call_llm([
-                {"role": "system", "content": "You estimate food delivery travel time based on distance. Return JSON only, no markdown."},
-                {"role": "user", "content": estimate_prompt},
-            ], max_tokens=50))
-            eta = int(_parse_json_from_llm(raw).get("eta_minutes", 30))
-            return eta if 1 <= eta <= 180 else 30
-        except (TypeError, ValueError):
-            return 30
+                {"role": "system", "content": "You extract contact details accurately. Return JSON only, no markdown."},
+                {"role": "user", "content": prompt},
+            ], max_tokens=150))
+            data = _parse_json_from_llm(raw)
+            full_name, email, phone = data.get("full_name"), data.get("email"), data.get("phone")
+            if not (
+                isinstance(full_name, str) and full_name.strip()
+                and isinstance(email, str) and email.strip()
+                and isinstance(phone, str) and phone.strip()
+            ):
+                return None
+            return {"full_name": full_name.strip(), "email": email.strip(), "phone": phone.strip()}
+        except Exception as err:
+            logger.warning("[_extract_contact_details] extraction failed: %s", err)
+            return None
+
+    def _attach_contact_to_order(self, order_id: int, full_name: str, email: str, phone: str) -> str | None:
+        print(f"==>> _attach_contact_to_order: called")
+        """Ensure a customer with these details exists and link them to an
+        already-created order, via LLM-authored SQL. Returns the customer's
+        name on success."""
+        task = f"""
+Attach a customer to an existing order.
+order id: {order_id}
+Customer full name: {self._sql_escape(full_name)}
+Customer email: {self._sql_escape(email)}
+Customer phone: {self._sql_escape(phone)}
+
+Write a CTE that:
+1. Ensures a customer with this email or phone exists — if one already
+   matches by email or phone, update their full_name/email/phone to these
+   values; otherwise insert a new customer row. Do NOT use ON CONFLICT on
+   full_name, since it is not unique.
+2. Updates the orders row with id = {order_id} to set its customer_id to
+   that customer's id.
+The final statement must be a SELECT returning the customer's full name,
+aliased EXACTLY as: customer_name.
+"""
+        rows = self._generate_and_run(task)
+        if not rows:
+            return None
+        return rows[0].get("customer_name") or full_name
+
+    def _order_summary_response(self, active_order: dict, prefix: str = "") -> str:
+        print(f"==>> _order_summary_response: called")
+        items = self._order_items(active_order["order_id"])
+        bill_lines = [
+            f"  • {i['item_name']} × {i['quantity']} — ₹{float(i['unit_price']) * i['quantity']:.2f}"
+            for i in items
+        ]
+        bill_text = "\n".join(bill_lines) if bill_lines else "  (no items found)"
+        eta = active_order.get("estimated_delivery_minutes")
+        return (
+            f"{prefix}"
+            f"🧾 **Order Summary** (from {active_order['cafe']}):"
+            f"\n{bill_text}"
+            f"\n\n💰 **Total: ₹{float(active_order['total_amount']):.2f}**"
+            + (f"\n⏱ Estimated delivery time: **~{eta} minutes**" if eta else "")
+            + "\n\nPlease type **CONFIRM** to place your order, or let me know if you would like to modify any items."
+        )
+
+    def _estimate_delivery_minutes(self, cafe_location: str, destination: str) -> int:
+        """Ask the LLM to estimate delivery time in minutes from the café
+        location to the customer's destination.
+
+        This is done as two separate LLM calls to avoid the fragility of
+        parsing a single strict-JSON response 
+
+          1. Ask the model, in plain text, to reason about where the two
+             places are relative to each other in Ahmedabad and give a
+             rough road distance in km. This has no output-format
+             constraints, so it can't fail to parse.
+          2. Feed that reasoning back and ask for a single integer
+             (15-90) as the final ETA. We pull the first integer out of
+             the response with a regex, so extra words, punctuation, or
+             formatting around the number don't break it.
+
+        Only if the model genuinely returns no usable number after a retry
+        does this fall back to a fixed default — and that fallback, plus
+        every raw response along the way, is logged so failures are
+        visible instead of silent.
+        """
+        print("==>> _estimate_delivery_minutes: called")
+
+        # Step 1: free-text geographic reasoning — nothing to parse, so it can't fail.
+        reasoning_prompt = f"""
+You are a local delivery-logistics expert for Ahmedabad, India.
+
+Café location: {cafe_location}
+Customer delivery destination: {destination}
+
+In 2-3 sentences, describe:
+- Roughly where these two places are relative to each other in Ahmedabad (same area, neighbouring areas, opposite sides of the city, etc.)
+- A realistic road distance between them in kilometers
+- Typical traffic/road conditions on that route
+
+Be concise and specific. Do not mention delivery time yet.
+"""
+        try:
+            reasoning = _clean_content(self._call_llm([
+                {"role": "system", "content": "You are a knowledgeable local Ahmedabad logistics expert."},
+                {"role": "user", "content": reasoning_prompt},
+            ], max_tokens=400))
+            logger.info(
+                "[_estimate_delivery_minutes] Distance reasoning for cafe=%r dest=%r: %r",
+                cafe_location, destination, reasoning,
+            )
+        except Exception as err:
+            print(f"==>> [_estimate_delivery_minutes] REASONING CALL FAILED: {type(err).__name__}: {err}")
+            logger.warning(
+                "[_estimate_delivery_minutes] Reasoning step failed for cafe=%r dest=%r: %s: %s",
+                cafe_location, destination, type(err).__name__, err,
+            )
+            reasoning = f"Café at {cafe_location}, destination at {destination}, both within Ahmedabad."
+
+        # Step 2: turn that reasoning into a single number, extracted with a regex
+        # so any stray words/punctuation around it don't break parsing.
+        number_prompt = f"""
+Based on this route assessment for a food delivery in Ahmedabad:
+
+"{reasoning}"
+
+Add about 10-15 minutes for kitchen preparation and rider dispatch on top of the travel time.
+
+Respond with ONLY a single whole number between 15 and 90 representing the total estimated delivery time in minutes. No words, no units, no punctuation - just the number.
+"""
+        for attempt in (1, 2):
+            try:
+                raw = _clean_content(self._call_llm([
+                    {"role": "system", "content": "You output a single integer and nothing else."},
+                    {"role": "user", "content": number_prompt},
+                ], max_tokens=100))
+                match = re.search(r"\d+", raw)
+                if not match:
+                    raise ValueError(f"No integer found in response: {raw!r}")
+                eta = max(15, min(90, int(match.group())))
+                logger.info(
+                    "[_estimate_delivery_minutes] cafe=%r dest=%r eta_min=%d (attempt %d, raw=%r)",
+                    cafe_location, destination, eta, attempt, raw,
+                )
+                return eta
+            except Exception as err:
+                print(f"==>> [_estimate_delivery_minutes] NUMBER CALL attempt {attempt} FAILED: {type(err).__name__}: {err}")
+                logger.warning(
+                    "[_estimate_delivery_minutes] Attempt %d failed to extract ETA for cafe=%r dest=%r: %s: %s",
+                    attempt, cafe_location, destination, type(err).__name__, err,
+                )
+
+        logger.error(
+            "[_estimate_delivery_minutes] Giving up after 2 attempts for cafe=%r dest=%r; using default ETA.",
+            cafe_location, destination,
+        )
+        return 45
 
     def _save_destination(self, destination: str, order_id: int | None = None) -> dict:
         print(f"==>> _save_destination: called")
@@ -647,28 +894,31 @@ Return JSON only: {{"eta_minutes": <whole number between 15 and 90>}}
                 "sql_query": None,
             }
 
-        order, restaurant = active_order
-        order.delivery_destination = destination
-        
-        # Calculate ETA based on distance between cafe location and customer destination using LLM
-        eta_minutes = self._estimate_delivery_minutes(restaurant.location, destination) or 30
-        order.estimated_delivery_minutes = eta_minutes
-        self.db.commit()
+        eta_minutes = self._estimate_delivery_minutes(active_order["location"], destination)
+
+        update_task = f"""
+Write an UPDATE that sets delivery_destination = '{self._sql_escape(destination)}' and
+estimated_delivery_minutes = {eta_minutes} on the orders row with id = {active_order['order_id']}.
+"""
+        if self._generate_and_run(update_task) is None:
+            return {
+                "response": "I had trouble saving your delivery destination. Could you try again?",
+                "sql_query": None,
+            }
 
         # Build itemized bill to show before asking for confirmation
-        items = order.items
-        bill_lines = []
-        for item in items:
-            bill_lines.append(
-                f"  • {item.item_name} × {item.quantity} — ₹{float(item.unit_price) * item.quantity:.2f}"
-            )
+        items = self._order_items(active_order["order_id"])
+        bill_lines = [
+            f"  • {i['item_name']} × {i['quantity']} — ₹{float(i['unit_price']) * i['quantity']:.2f}"
+            for i in items
+        ]
         bill_text = "\n".join(bill_lines) if bill_lines else "  (no items found)"
 
         response = (
             f"📍 Delivery destination set to **{destination}**."
-            f"\n\n🧾 **Order Summary** (from {restaurant.cafe}):"
+            f"\n\n🧾 **Order Summary** (from {active_order['cafe']}):"
             f"\n{bill_text}"
-            f"\n\n💰 **Total: ₹{float(order.total_amount):.2f}**"
+            f"\n\n💰 **Total: ₹{float(active_order['total_amount']):.2f}**"
             f"\n⏱ Estimated delivery time: **~{eta_minutes} minutes**"
             f"\n\nPlease type **CONFIRM** to place your order, or let me know if you would like to modify any items."
         )
@@ -683,37 +933,44 @@ Return JSON only: {{"eta_minutes": <whole number between 15 and 90>}}
         if not active_order:
             return {"response": "I couldn't find an active order to confirm.", "sql_query": None}
 
-        order, restaurant = active_order
-        if not order.delivery_destination:
+        if not active_order.get("delivery_destination"):
             return {
                 "response": "Please provide your delivery destination before confirming the order.",
                 "sql_query": None,
             }
 
-        if not order.estimated_delivery_minutes:
-            order.estimated_delivery_minutes = self._estimate_delivery_minutes(restaurant.location, order.delivery_destination) or 30
+        if not (active_order.get("customer_name") and active_order.get("customer_email") and active_order.get("customer_phone")):
+            return {
+                "response": "Before I can confirm your order, could you share your full name, email, and phone number?",
+                "sql_query": None,
+            }
 
-        order.confirmed_at = datetime.now()
-        order.status = OrderStatus.confirmed
-        self.db.commit()
+        eta_minutes = active_order.get("estimated_delivery_minutes")
+        if not eta_minutes:
+            eta_minutes = self._estimate_delivery_minutes(active_order["location"], active_order["delivery_destination"])
 
-        # Build itemized bill for confirmation message
-        items = order.items
-        bill_lines = []
-        for item in items:
-            bill_lines.append(
-                f"  • {item.item_name} × {item.quantity} — ₹{float(item.unit_price) * item.quantity:.2f}"
-            )
+        update_task = f"""
+Write an UPDATE that sets status = 'confirmed', confirmed_at = NOW(), and
+estimated_delivery_minutes = {eta_minutes} on the orders row with id = {active_order['order_id']}.
+"""
+        if self._generate_and_run(update_task) is None:
+            return {"response": "I had trouble confirming your order. Could you try again?", "sql_query": None}
+
+        items = self._order_items(active_order["order_id"])
+        bill_lines = [
+            f"  • {i['item_name']} × {i['quantity']} — ₹{float(i['unit_price']) * i['quantity']:.2f}"
+            for i in items
+        ]
         bill_text = "\n".join(bill_lines) if bill_lines else "  (no items)"
 
         return {
             "response": (
-                f"🎉 Order **#{order.id}** placed successfully!"
+                f"🎉 Order **#{active_order['order_id']}** placed successfully!"
                 f"\n\n🧾 **Bill Summary:**"
                 f"\n{bill_text}"
-                f"\n💰 **Total: ₹{float(order.total_amount):.2f}**"
-                f"\n\n🛵 Delivering to **{order.delivery_destination}**."
-                f"\n⏱ Estimated delivery time: **~{order.estimated_delivery_minutes} minutes**."
+                f"\n💰 **Total: ₹{float(active_order['total_amount']):.2f}**"
+                f"\n\n🛵 Delivering to **{active_order['delivery_destination']}**."
+                f"\n⏱ Estimated delivery time: **~{eta_minutes} minutes**."
                 f"\n\nYou can ask *'how much time is left?'* anytime to check your remaining delivery time."
             ),
             "sql_query": None,
@@ -726,23 +983,29 @@ Return JSON only: {{"eta_minutes": <whole number between 15 and 90>}}
         active_order = self._latest_active_order(order_id)
         if not active_order:
             if order_id:
-                completed = self.db.scalar(select(Order).where(Order.id == order_id).limit(1))
-                if completed and completed.status == OrderStatus.completed:
+                rows = self._generate_and_run(f"""
+Write a SELECT that returns status and delivery_destination for the orders
+row with id = {order_id}.
+Alias the returned columns EXACTLY as: order_status, delivery_destination.
+""")
+                row = rows[0] if rows else None
+                if row and row.get("order_status") == "completed":
                     return {
-                        "response": f"🎉 Your order placed successfully! Order **#{completed.id}** has been delivered to **{completed.delivery_destination or 'your destination'}**! Enjoy your meal! 🍽️",
+                        "response": f"🎉 Your order placed successfully! Order **#{order_id}** has been delivered to **{row.get('delivery_destination') or 'your destination'}**! Enjoy your meal! 🍽️",
                         "sql_query": None,
                     }
             return {"response": "I couldn't find an active order.", "sql_query": None}
 
-        order, restaurant = active_order
-        if order.status == OrderStatus.completed:
+        order_id = active_order["order_id"]
+
+        if active_order["order_status"] == "completed":
             return {
-                "response": f"🎉 Your order placed successfully! Order **#{order.id}** has been delivered to **{order.delivery_destination or 'your destination'}**! Enjoy your meal! 🍽️",
+                "response": f"🎉 Your order placed successfully! Order **#{order_id}** has been delivered to **{active_order.get('delivery_destination') or 'your destination'}**! Enjoy your meal! 🍽️",
                 "sql_query": None,
             }
 
-        if order.status == OrderStatus.pending or not order.confirmed_at:
-            if not order.delivery_destination:
+        if active_order["order_status"] == "pending" or not active_order.get("confirmed_at"):
+            if not active_order.get("delivery_destination"):
                 return {
                     "response": "Please provide your delivery destination first so we can prepare your order summary.",
                     "sql_query": None,
@@ -752,25 +1015,28 @@ Return JSON only: {{"eta_minutes": <whole number between 15 and 90>}}
                 "sql_query": None,
             }
 
-        confirmed_at = order.confirmed_at
-        if confirmed_at and confirmed_at.tzinfo is not None:
+        confirmed_at = active_order["confirmed_at"]
+        if isinstance(confirmed_at, str):
+            confirmed_at = datetime.fromisoformat(confirmed_at)
+        if confirmed_at.tzinfo is not None:
             confirmed_at = confirmed_at.replace(tzinfo=None)
 
         now = datetime.now()
         elapsed_seconds = max(0.0, (now - confirmed_at).total_seconds())
         elapsed_minutes = int(elapsed_seconds // 60)
-        estimated_total = order.estimated_delivery_minutes or 30
+        estimated_total = active_order["estimated_delivery_minutes"]
         remaining_minutes = max(0, estimated_total - elapsed_minutes)
 
         logger.info("[_delivery_status] order_id=%s, confirmed_at=%s, now=%s, elapsed_sec=%.1f, elapsed_min=%d, remaining_min=%d",
-                    order.id, confirmed_at, now, elapsed_seconds, elapsed_minutes, remaining_minutes)
+                    order_id, confirmed_at, now, elapsed_seconds, elapsed_minutes, remaining_minutes)
 
         if remaining_minutes <= 0:
-            order.status = OrderStatus.completed
-            self.db.commit()
+            self._generate_and_run(f"""
+Write an UPDATE that sets status = 'completed' on the orders row with id = {order_id}.
+""")
             return {
                 "response": (
-                    f"🎉 Your order placed successfully! Order **#{order.id}** has been delivered to **{order.delivery_destination}**! "
+                    f"🎉 Your order placed successfully! Order **#{order_id}** has been delivered to **{active_order['delivery_destination']}**! "
                     "Enjoy your meal! 🍽️"
                 ),
                 "sql_query": None,
@@ -779,7 +1045,7 @@ Return JSON only: {{"eta_minutes": <whole number between 15 and 90>}}
         elapsed_display = f"{elapsed_minutes} minute{'s' if elapsed_minutes != 1 else ''}" if elapsed_minutes > 0 else "less than a minute"
         return {
             "response": (
-                f"🛵 Your order **#{order.id}** is on the way to **{order.delivery_destination}**!"
+                f"🛵 Your order **#{order_id}** is on the way to **{active_order['delivery_destination']}**!"
                 f"\n⏱ Time elapsed: {elapsed_display}"
                 f"\n⏳ Estimated time remaining: **~{remaining_minutes} minute{'s' if remaining_minutes != 1 else ''}**."
             ),
@@ -820,17 +1086,51 @@ Return JSON only: {{"eta_minutes": <whole number between 15 and 90>}}
 
         # 5. User is providing contact details to complete an order
         elif intent == "contact_followup":
-            result = self._create_order_from_llm(history, user_message, session_id)
-            if not result:
-                result = {
-                    "response": "Thank you for sharing your contact details! Which café and menu items would you like to order?",
-                    "sql_query": None,
-                }
+            if session_order_id:
+                # An order already exists (e.g. created before contact details
+                # were collected) — attach the customer to it rather than
+                # trying to spin up a duplicate order.
+                contact = self._extract_contact_details(history, user_message)
+                if not contact:
+                    result = {
+                        "response": "Could you share your full name, email, and phone number so I can attach them to your order?",
+                        "sql_query": None,
+                    }
+                else:
+                    customer_name = self._attach_contact_to_order(session_order_id, **contact)
+                    if not customer_name:
+                        result = {
+                            "response": "I had trouble saving your contact details. Could you share your name, email, and phone number again?",
+                            "sql_query": None,
+                        }
+                    else:
+                        order_pair = self._latest_active_order(session_order_id)
+                        if order_pair and order_pair.get("delivery_destination"):
+                            result = {
+                                "response": self._order_summary_response(order_pair, prefix=f"Thanks, {customer_name}! "),
+                                "sql_query": None,
+                            }
+                        else:
+                            result = {
+                                "response": (
+                                    f"Thanks, {customer_name}! 🛵 Please share your **delivery destination** "
+                                    "(area/address in Ahmedabad) so I can prepare your order summary and calculate a delivery estimate for you."
+                                ),
+                                "sql_query": None,
+                            }
+            else:
+                result = self._create_order_from_llm(history, user_message, session_id)
+                print("result:", result)
+                if not result:
+                    result = {
+                        "response": "Thank you for sharing your contact details! Which café and menu items would you like to order?",
+                        "sql_query": None,
+                    }
 
         # 6. Active pending order missing destination: process address unless it's a menu inquiry
         elif session_order_id:
             order_pair = self._latest_active_order(session_order_id)
-            if order_pair and order_pair[0].status == OrderStatus.pending and not order_pair[0].delivery_destination:
+            if order_pair and order_pair.get("order_status") == "pending" and not order_pair.get("delivery_destination"):
                 if not any(w in user_message.lower() for w in ["menu", "top cafe", "show cafe", "what is", "help me", "recommend"]):
                     result = self._save_destination(user_message.strip(), session_order_id)
 
