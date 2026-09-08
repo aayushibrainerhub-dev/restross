@@ -1,3 +1,4 @@
+from sqlalchemy import JSON
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -26,6 +27,8 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(30), default="staff")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # One-to-one: a registered user can have a customer profile
+    customer: Mapped["Customer | None"] = relationship(back_populates="user", uselist=False)
 
 
 class Restaurant(Base):
@@ -45,12 +48,15 @@ class Restaurant(Base):
 class Customer(Base):
     __tablename__ = "customers"
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    # Link to a registered User account (optional — walk-in customers have no account)
+    user_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), unique=True, index=True)
     full_name: Mapped[str] = mapped_column(String(150))
     phone: Mapped[str | None] = mapped_column(String(40), unique=True)
     email: Mapped[str | None] = mapped_column(String(255), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    destination: Mapped[str | None] = mapped_column(JSON)
     orders: Mapped[list["Order"]] = relationship(back_populates="customer")
-    destination: Mapped[str | None] = mapped_column(String(255))
+    user: Mapped["User | None"] = relationship(back_populates="customer")
 
 
 class Order(Base):

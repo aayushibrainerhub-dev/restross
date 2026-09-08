@@ -8,8 +8,8 @@ class Settings(BaseSettings):
     # Set DATABASE_URL in .env. Example:
     # postgresql+psycopg://user:password@host:5432/restaurant
     database_url: str = ""
-    openrouter_api_key: str = ""
-    openrouter_model: str = "openai/gpt-oss-20b"
+    groq_api_key: str = ""
+    groq_model: str = "openai/gpt-oss-20b"
     debug: bool = True
     api_prefix: str = "/api/v1"
 

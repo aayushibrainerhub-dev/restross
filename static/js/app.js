@@ -25,6 +25,18 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
+    // --- Auth Helpers ---
+    function getAuthHeaders() {
+        const token = localStorage.getItem('access_token');
+        return token ? { 'Authorization': `Bearer ${token}` } : {};
+    }
+
+    function handleUnauthorized() {
+        localStorage.removeItem('access_token');
+        localStorage.removeItem('user');
+        window.location.href = '/login';
+    }
+
     // Health Check
     async function checkHealth() {
         const healthStatus = document.getElementById('health-status');
@@ -47,7 +59,10 @@ document.addEventListener('DOMContentLoaded', () => {
         
         try {
             // Using correct API prefix matching the FastAPI setup
-            const response = await fetch('/api/v1/restaurants');
+            const response = await fetch('/api/v1/restaurants', {
+                headers: getAuthHeaders()
+            });
+            if (response.status === 401) { handleUnauthorized(); return; }
             if (!response.ok) throw new Error('Failed to fetch');
             
             const data = await response.json();
@@ -195,9 +210,22 @@ document.addEventListener('DOMContentLoaded', () => {
             
             if (messageText) {
                 const userMsgEl = document.createElement('div');
-                userMsgEl.className = 'message user';
+                userMsgEl.className = 'message-wrapper user-wrapper';
                 const timeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                userMsgEl.innerHTML = `<p>${escapeHtml(messageText)}</p><span class="msg-time">${timeString}</span>`;
+                userMsgEl.innerHTML = `
+                    <img src="https://cdn-icons-png.flaticon.com/512/3177/3177440.png" class="avatar" alt="User">
+                    <div class="message-content-container">
+                        <div class="message-header">
+                            <span class="name">You</span>
+                            <span class="time">${timeString}</span>
+                        </div>
+                        <div class="message user">
+                            <div class="markdown-body">
+                                <p>${escapeHtml(messageText)}</p>
+                            </div>
+                        </div>
+                    </div>
+                `;
                 chatMessages.appendChild(userMsgEl);
                 
                 // Clear input
@@ -208,21 +236,39 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 // Add loading indicator
                 const loadingMsgEl = document.createElement('div');
-                loadingMsgEl.className = 'message bot';
+                loadingMsgEl.className = 'message-wrapper bot-wrapper';
                 loadingMsgEl.id = 'chat-loading';
-                loadingMsgEl.textContent = "Thinking & querying database...";
+                loadingMsgEl.innerHTML = `
+                    <img src="https://cdn-icons-png.flaticon.com/512/4712/4712139.png" class="avatar" alt="AI">
+                    <div class="message-content-container">
+                        <div class="message-header">
+                            <span class="name">DesignPilot AI</span>
+                            <span class="time">...</span>
+                        </div>
+                        <div class="message bot">
+                            <div class="markdown-body">
+                                <p>Thinking & querying database...</p>
+                            </div>
+                        </div>
+                    </div>
+                `;
                 chatMessages.appendChild(loadingMsgEl);
                 chatMessages.scrollTop = chatMessages.scrollHeight;
 
                 try {
                     const response = await fetch('/api/v1/chat', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: {
+                            'Content-Type': 'application/json',
+                            ...getAuthHeaders()
+                        },
                         body: JSON.stringify({ 
                             message: messageText,
                             session_id: sessionId
                         })
                     });
+
+                    if (response.status === 401) { loadingMsgEl.remove(); handleUnauthorized(); return; }
 
                     loadingMsgEl.remove();
 
@@ -233,10 +279,83 @@ document.addEventListener('DOMContentLoaded', () => {
                     const data = await response.json();
                     
                     const botMsgEl = document.createElement('div');
-                    botMsgEl.className = 'message bot';
+                    botMsgEl.className = 'message-wrapper bot-wrapper';
                     const botTimeString = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                    botMsgEl.innerHTML = `<p>${escapeHtml(data.response).replace(/\\n/g, '<br>')}</p><span class="msg-time">${botTimeString}</span>`;
+                    
+                    // Parse Markdown safely
+                    const parsedMarkdown = window.marked ? marked.parse(data.response) : `<p>${escapeHtml(data.response).replace(/\n/g, '<br>')}</p>`;
+
+                    botMsgEl.innerHTML = `
+                        <img src="https://cdn-icons-png.flaticon.com/512/4712/4712139.png" class="avatar" alt="AI">
+                        <div class="message-content-container">
+                            <div class="message-header">
+                                <span class="name">DesignPilot AI</span>
+                                <span class="time">${botTimeString}</span>
+                            </div>
+                            <div class="message bot">
+                                <div class="markdown-body">
+                                    ${parsedMarkdown}
+                                </div>
+                            </div>
+                        </div>
+                    `;
                     chatMessages.appendChild(botMsgEl);
+
+                    // Show the address picker whenever the backend signals ask_destination
+                    if (data.ask_destination) {
+                        const hasSaved = data.past_addresses && data.past_addresses.length > 0;
+                        const chipsWrapper = document.createElement('div');
+                        chipsWrapper.className = 'message-wrapper bot-wrapper address-chips-wrapper';
+                        chipsWrapper.innerHTML = `
+                            <span style="width:36px;flex-shrink:0;"></span>
+                            <div class="address-chips">
+                                <span class="chips-label">📍 Choose a delivery address</span>
+                                <div class="chips-row" id="address-chips-row">
+                                    ${hasSaved ? data.past_addresses.map((addr, i) => `
+                                        <button class="address-chip" data-address="${escapeHtml(addr)}" id="chip-addr-${i}">
+                                            📌 ${escapeHtml(addr)}
+                                        </button>`).join('') : ''}
+                                    <button class="address-chip chip-new" id="chip-new">✏️ Enter new address</button>
+                                </div>
+                                <div class="chips-inline-input" id="chips-new-input-row" style="display:none;">
+                                    <input type="text" id="dest-inline-input" placeholder="Type your delivery address…" autocomplete="off" />
+                                    <button class="address-chip chip-submit" id="chip-submit-btn">→ Confirm</button>
+                                </div>
+                            </div>
+                        `;
+                        chatMessages.appendChild(chipsWrapper);
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+
+                        // Saved address chips → one click submits
+                        chipsWrapper.querySelectorAll('.address-chip[data-address]').forEach(btn => {
+                            btn.addEventListener('click', () => {
+                                chatInput.value = btn.dataset.address;
+                                chipsWrapper.remove();
+                                chatForm.requestSubmit();
+                            });
+                        });
+
+                        // "Enter new address" chip → reveal inline input below
+                        chipsWrapper.querySelector('#chip-new').addEventListener('click', () => {
+                            const inputRow = chipsWrapper.querySelector('#chips-new-input-row');
+                            inputRow.style.display = 'flex';
+                            chipsWrapper.querySelector('#dest-inline-input').focus();
+                        });
+
+                        // Submit inline input
+                        function doInlineSubmit() {
+                            const val = chipsWrapper.querySelector('#dest-inline-input')?.value?.trim();
+                            if (!val) return;
+                            chatInput.value = val;
+                            chipsWrapper.remove();
+                            chatForm.requestSubmit();
+                        }
+                        chipsWrapper.querySelector('#chip-submit-btn').addEventListener('click', doInlineSubmit);
+                        chipsWrapper.querySelector('#dest-inline-input').addEventListener('keydown', e => {
+                            if (e.key === 'Enter') { e.preventDefault(); doInlineSubmit(); }
+                        });
+                    }
+
 
                     // If this is an order confirmation, start delivery countdown
                     if (isOrderConfirmation(data.response)) {
@@ -248,9 +367,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 } catch (err) {
                     loadingMsgEl.remove();
                     const errorMsgEl = document.createElement('div');
-                    errorMsgEl.className = 'message bot';
-                    errorMsgEl.style.color = 'var(--error)';
-                    errorMsgEl.textContent = `Sorry, I couldn't process your request: ${err.message}`;
+                    errorMsgEl.className = 'message-wrapper bot-wrapper';
+                    errorMsgEl.innerHTML = `
+                        <img src="https://cdn-icons-png.flaticon.com/512/4712/4712139.png" class="avatar" alt="AI">
+                        <div class="message-content-container">
+                            <div class="message-header">
+                                <span class="name">DesignPilot AI</span>
+                                <span class="time">Error</span>
+                            </div>
+                            <div class="message bot" style="color: var(--error);">
+                                <div class="markdown-body">
+                                    <p>Sorry, I couldn't process your request: ${escapeHtml(err.message)}</p>
+                                </div>
+                            </div>
+                        </div>
+                    `;
                     chatMessages.appendChild(errorMsgEl);
                 }
 
