@@ -73,6 +73,7 @@ app.include_router(auth.router, prefix=settings.api_prefix, dependencies=api_dep
 # Protected API routers locked centrally via main.py protected_dependencies list
 for router in (chat.router, restaurants.router):
     app.include_router(router, prefix=settings.api_prefix, dependencies=protected_dependencies)
+app.include_router(chat.websocket_router, prefix=settings.api_prefix)
 
 
 @app.get("/health", tags=["health"])

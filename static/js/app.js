@@ -296,6 +296,7 @@ document.addEventListener('DOMContentLoaded', () => {
                                 <div class="markdown-body">
                                     ${parsedMarkdown}
                                 </div>
+                                ${(data.tokens_used > 0) ? `<div class="token-info">🔢 ${data.tokens_used} tokens · $${data.total_cost.toFixed(6)}</div>` : ''}
                             </div>
                         </div>
                     `;

@@ -75,35 +75,35 @@ def create_access_token(data: dict, expires_delta: Optional[int] = None) -> str:
 
 
 def decode_access_token(token: str) -> Optional[dict]:
-    print("called----------decode_access_token")
+    # print("called----------decode_access_token")
     try:
         parts = token.split('.')
-        print("[DEBUG] Token parts:", parts)
+        # print("[DEBUG] Token parts:", parts)
         if len(parts) != 3:
-            print("[DEBUG] Invalid token structure")
+            # print("[DEBUG] Invalid token structure")
             return None
         header_b64, payload_b64, signature_b64 = parts
 
         # Decode header and payload for logging
         try:
             header_json = json.loads(base64url_decode(header_b64).decode('utf-8'))
-            print("[DEBUG] Decoded header:", header_json)
+            # print("[DEBUG] Decoded header:", header_json)
         except Exception as e:
             header_json = None
-            print("[DEBUG] Header decode error:", e)
+            # print("[DEBUG] Header decode error:", e)
         try:
             payload_json = json.loads(base64url_decode(payload_b64).decode('utf-8'))
-            print("[DEBUG] Decoded payload (pre‑validation):", payload_json)
+            # print("[DEBUG] Decoded payload (pre‑validation):", payload_json)
         except Exception as e:
             payload_json = None
-            print("[DEBUG] Payload decode error:", e)
+            # print("[DEBUG] Payload decode error:", e)
 
         # Verify signature
         signing_input = f"{header_b64}.{payload_b64}".encode('utf-8')
         expected_sig = hmac.new(SECRET_KEY.encode('utf-8'), signing_input, hashlib.sha256).digest()
         expected_sig_b64 = base64url_encode(expected_sig)
         signature_valid = hmac.compare_digest(signature_b64, expected_sig_b64)
-        print("[DEBUG] Signature valid:", signature_valid)
+        # print("[DEBUG] Signature valid:", signature_valid)
         if not signature_valid:
             return None
 
@@ -112,14 +112,14 @@ def decode_access_token(token: str) -> Optional[dict]:
         # Check expiration
         exp = payload.get("exp", 0)
         now = time.time()
-        print(f"[DEBUG] Expiration check – exp: {exp}, now: {now}, valid: {exp > now}")
+        # print(f"[DEBUG] Expiration check – exp: {exp}, now: {now}, valid: {exp > now}")
         if exp < now:
             return None
 
-        print("[DEBUG] Token successfully validated and decoded")
+        # print("[DEBUG] Token successfully validated and decoded")
         return payload
     except Exception as e:
-        print("[DEBUG] Unexpected error during decode_access_token:", e)
+        # print("[DEBUG] Unexpected error during decode_access_token:", e)
         return None
 
 
@@ -158,5 +158,21 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             detail="Authenticated user no longer exists",
         )
     return user
+
+
+async def get_user_from_token(token: str, db: AsyncSession) -> User | None:
+    """Resolve a bearer token for protocols that cannot use HTTP dependencies."""
+    payload = decode_access_token(token)
+    user_id = payload.get("user_id") if payload else None
+    if not user_id:
+        return None
+    try:
+        user_id = uuid.UUID(str(user_id))
+    except ValueError:
+        return None
+    result = await db.execute(
+        select(User).where(User.id == user_id, User.is_active.is_(True))
+    )
+    return result.scalar_one_or_none()
 
 

@@ -31,6 +31,16 @@ class User(Base):
     customer: Mapped["Customer | None"] = relationship(back_populates="user", uselist=False)
 
 
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sender_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), index=True)
+    recipient_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class Restaurant(Base):
     __tablename__ = "restaurants"
     id: Mapped[int] = mapped_column(primary_key=True)

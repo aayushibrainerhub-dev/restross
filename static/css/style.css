@@ -578,3 +578,12 @@ body {
     border-color: var(--primary-hover);
     box-shadow: 0 4px 10px rgba(79, 70, 229, 0.3);
 }
+
+/* Token usage info shown below bot messages */
+.token-info {
+    margin-top: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    opacity: 0.75;
+    letter-spacing: 0.01em;
+}

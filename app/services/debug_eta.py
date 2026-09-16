@@ -6,64 +6,55 @@ Run this directly (no FastAPI app, no DB) to see exactly what's happening:
     python debug_eta.py
 
 It will print:
-  - whether OPENROUTER_AI_API_KEY / OPENROUTER_MODEL are set
-  - the raw HTTP status + body from OpenRouter for a test call
+    - whether GROQ_API_KEY / GROQ_MODEL are set
+    - the raw HTTP status + body from Groq for a test call
   - the raw text the model returns for the reasoning step
   - the raw text the model returns for the number step
   - whichever exception (if any) is actually being thrown
 
-Make sure your .env (or environment) has OPENROUTER_AI_API_KEY and
-OPENROUTER_MODEL set the same way your app does before running this.
+Make sure your .env (or environment) has GROQ_API_KEY and GROQ_MODEL
+set the same way your app does before running this.
 """
 import os
 import re
+import sys
 import httpx
 import dotenv
 
 dotenv.load_dotenv()
 
-API_KEY = os.getenv("OPENROUTER_AI_API_KEY")
-MODEL = os.getenv("OPENROUTER_MODEL")
+API_KEY = os.getenv("GROQ_API_KEY")
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+if MODEL == "llama-3.3-70b-versatile":
+    MODEL = "openai/gpt-oss-20b"
 
 print("=" * 70)
-print(f"OPENROUTER_AI_API_KEY set: {bool(API_KEY)}")
+print(f"GROQ_API_KEY set: {bool(API_KEY)}")
 if API_KEY:
     print(f"  starts with: {API_KEY[:8]}...")
-print(f"OPENROUTER_MODEL: {MODEL!r}")
+print(f"GROQ_MODEL: {MODEL!r}")
 print("=" * 70)
 
 if not API_KEY:
-    print("\n❌ OPENROUTER_AI_API_KEY is not set in this environment.")
+    print("\n❌ GROQ_API_KEY is not set in this environment.")
     print("   This is almost certainly why every LLM call fails and you")
     print("   fall back to the default 45-minute ETA. Set it in your .env")
     print("   or export it before running your app.")
     raise SystemExit(1)
 
-if not MODEL:
-    print("\n⚠️  OPENROUTER_MODEL is not set. OpenRouter may reject the")
-    print("   request or use an unexpected default model.")
-
-
 def call_llm(messages, max_tokens=200):
     with httpx.Client(timeout=20.0) as client:
         response = client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://api.groq.com/openai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {API_KEY}",
                 "Content-Type": "application/json",
-                "X-OpenRouter-Title": "Restros",
             },
             json={
                 "model": MODEL,
                 "messages": messages,
                 "temperature": 0.1,
                 "max_tokens": max_tokens,
-                # gpt-oss and other "reasoning" models spend tokens on hidden
-                # thinking before writing the visible answer. Without this,
-                # a small max_tokens gets fully consumed by reasoning and
-                # `content` comes back None. This caps/limits that reasoning
-                # so tokens are left for the actual answer.
-                "reasoning": {"effort": "low", "exclude": True},
             },
         )
     print(f"  HTTP status: {response.status_code}")
@@ -81,8 +72,12 @@ def call_llm(messages, max_tokens=200):
     return content
 
 
-cafe_location = "Satellite, Ahmedabad"
-destination = "Bopal, Ahmedabad"
+if len(sys.argv) != 3:
+    print("Usage: python app/services/debug_eta.py \"<cafe location>\" \"<destination>\"")
+    print('Example: python app/services/debug_eta.py "Satellite, Ahmedabad" "Bopal, Ahmedabad"')
+    raise SystemExit(2)
+
+cafe_location, destination = sys.argv[1:]
 
 print(f"\nTest café location: {cafe_location!r}")
 print(f"Test destination:    {destination!r}")

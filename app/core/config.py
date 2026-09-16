@@ -5,11 +5,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "Restaurant API"
-    # Set DATABASE_URL in .env. Example:
-    # postgresql+psycopg://user:password@host:5432/restaurant
     database_url: str = ""
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-20b"
+    langfuse_model_name: str = ""
+    langfuse_enabled: bool = True
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = "http://localhost:3000"
     debug: bool = True
     api_prefix: str = "/api/v1"
 

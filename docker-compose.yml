@@ -1,29 +1,391 @@
 services:
+
+  # =========================================================
+  # RESTAURANT API
+  # =========================================================
   api:
     build: .
     ports:
       - "8000:8000"
-    env_file: .env
+
+    env_file:
+      - .env
+
     volumes:
       - ./:/code
+
     depends_on:
       db:
         condition: service_healthy
+
+  # =========================================================
+  # RESTAURANT POSTGRESQL
+  # =========================================================
   db:
     image: postgres:16-alpine
+
     environment:
       POSTGRES_DB: restaurant
       POSTGRES_USER: restaurant
       POSTGRES_PASSWORD: restaurant
-    ports:
-      - "5432:5432"
+
+    # No host port mapping.
+    # API accesses it using: db:5432
+
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - restaurant_postgres_data:/var/lib/postgresql/data
+
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U restaurant -d restaurant"]
+      test: [ "CMD-SHELL", "pg_isready -U restaurant -d restaurant" ]
       interval: 5s
       timeout: 5s
       retries: 5
 
+  # =========================================================
+  # LANGFUSE WORKER
+  # =========================================================
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    restart: always
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+    # ports:
+    #   - "127.0.0.1:3030:3030"
+
+    environment:
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET}
+      SLACK_STATE_SECRET: ${SLACK_STATE_SECRET}
+
+      # -----------------------------------------------------
+      # Authentication / Application
+      # -----------------------------------------------------
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+
+      SALT: ${SALT:-mysalt}
+
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
+
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+      LANGFUSE_MIGRATION_V4_WRITE_MODE: ${LANGFUSE_MIGRATION_V4_WRITE_MODE:-dual}
+
+      # -----------------------------------------------------
+      # ClickHouse
+      # -----------------------------------------------------
+      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+
+      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
+
+      CLICKHOUSE_CLUSTER_NAME: ${CLICKHOUSE_CLUSTER_NAME:-default}
+
+      # -----------------------------------------------------
+      # S3 / MinIO - Events
+      # -----------------------------------------------------
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
+
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
+
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
+
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
+
+      # -----------------------------------------------------
+      # S3 / MinIO - Media
+      # -----------------------------------------------------
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://minio:9000}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
+
+      # -----------------------------------------------------
+      # Redis
+      # -----------------------------------------------------
+      REDIS_HOST: ${REDIS_HOST:-redis}
+
+      REDIS_PORT: ${REDIS_PORT:-6379}
+
+      REDIS_AUTH: ${REDIS_AUTH:-myredissecret}
+
+      LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK: ${LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK:-false}
+
+      REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED:-false}
+
+      # -----------------------------------------------------
+      # Email
+      # -----------------------------------------------------
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+
+      SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
+
+  # =========================================================
+  # LANGFUSE WEB
+  # =========================================================
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    restart: always
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      HOSTNAME: 0.0.0.0
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET}
+      SLACK_STATE_SECRET: ${SLACK_STATE_SECRET}
+
+      # -----------------------------------------------------
+      # Authentication
+      # -----------------------------------------------------
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret}
+
+      LANGFUSE_MIGRATION_V4_WRITE_MODE: ${LANGFUSE_MIGRATION_V4_WRITE_MODE:-dual}
+
+      # -----------------------------------------------------
+      # PostgreSQL
+      # -----------------------------------------------------
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+
+      SALT: ${SALT:-mysalt}
+
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+
+      # -----------------------------------------------------
+      # ClickHouse
+      # -----------------------------------------------------
+      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+
+      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
+
+      # -----------------------------------------------------
+      # Redis
+      # -----------------------------------------------------
+      REDIS_HOST: ${REDIS_HOST:-redis}
+
+      REDIS_PORT: ${REDIS_PORT:-6379}
+
+      REDIS_AUTH: ${REDIS_AUTH:-myredissecret}
+
+      # -----------------------------------------------------
+      # MinIO / S3 - Media
+      # -----------------------------------------------------
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT:-http://minio:9000}
+
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
+
+      # -----------------------------------------------------
+      # S3 / MinIO - Events
+      # -----------------------------------------------------
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
+
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret}
+
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
+
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
+
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
+
+      # -----------------------------------------------------
+      # Optional automatic initialization
+      # -----------------------------------------------------
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+
+  # =========================================================
+  # LANGFUSE CLICKHOUSE
+  # =========================================================
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    restart: always
+
+    user: "101:101"
+
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+
+    # Only expose HTTP port.
+    # Native port 9000 stays internal.
+    # ports:
+    #   - "127.0.0.1:8123:8123"
+
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  # =========================================================
+  # LANGFUSE MINIO
+  # =========================================================
+  minio:
+    image: cgr.dev/chainguard/minio
+    restart: always
+
+    entrypoint: sh
+
+    command: >
+      -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+
+    volumes:
+      - langfuse_minio_data:/data
+
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  # =========================================================
+  # LANGFUSE REDIS
+  # =========================================================
+  redis:
+    image: docker.io/redis:7
+    restart: always
+
+    command: >
+      --requirepass ${REDIS_AUTH:-myredissecret} --maxmemory-policy noeviction
+
+    volumes:
+      - langfuse_redis_data:/data
+
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_AUTH:-myredissecret}", "ping" ]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  # =========================================================
+  # LANGFUSE POSTGRESQL
+  # =========================================================
+  postgres:
+    image: docker.io/postgres:${POSTGRES_VERSION:-17}
+    restart: always
+
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+
+      TZ: UTC
+      PGTZ: UTC
+
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+
+# =========================================================
+# PERSISTENT VOLUMES
+# =========================================================
 volumes:
-  postgres_data:
+
+  # Restaurant database
+  restaurant_postgres_data:
+
+  # Langfuse databases/storage
+  langfuse_postgres_data:
+
+  langfuse_clickhouse_data:
+
+  langfuse_clickhouse_logs:
+
+  langfuse_minio_data:
+
+  langfuse_redis_data:
